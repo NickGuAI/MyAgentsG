@@ -4,6 +4,8 @@
 
 MyAgents 是基于 Tauri v2 的桌面应用，提供 Claude Agent SDK 的图形界面。
 
+> **可视化参考**：完整的 ASCII 架构图（含模块级细节、数据流、存储布局等）见 [architecture_visual.md](./architecture_visual.md)。
+
 ## 技术栈
 
 | 层级 | 技术 |

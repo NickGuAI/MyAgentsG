@@ -494,6 +494,7 @@ log::info!("internal message");
 |------|------|
 | **版本发布记录** | [CHANGELOG.md](./CHANGELOG.md) |
 | 整体架构、数据流 | [architecture.md](./specs/tech_docs/architecture.md) |
+| **架构可视化 (ASCII)** | [architecture_visual.md](./specs/tech_docs/architecture_visual.md) |
 | **IM Bot 集成架构** | [im_integration_architecture.md](./specs/tech_docs/im_integration_architecture.md) |
 | 集成新 LLM 供应商 | [third_party_providers.md](./specs/tech_docs/third_party_providers.md) |
 | Bun Sidecar 打包机制 | [bundled_bun.md](./specs/tech_docs/bundled_bun.md) |
