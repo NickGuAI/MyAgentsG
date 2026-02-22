@@ -5,9 +5,11 @@ pub mod adapter;
 pub mod buffer;
 pub mod feishu;
 pub mod health;
+pub mod heartbeat;
 pub mod router;
 pub mod telegram;
 pub mod types;
+mod util;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -44,6 +46,11 @@ struct PendingApproval {
 
 type PendingApprovals = Arc<Mutex<HashMap<String, PendingApproval>>>;
 
+/// Per-peer locks: serializes requests (IM chat + heartbeat) to the same Sidecar.
+/// Required because /api/im/chat uses a single imStreamCallback; concurrent
+/// requests would conflict. Shared between processing loop and heartbeat runner.
+pub(crate) type PeerLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+
 use buffer::MessageBuffer;
 use feishu::FeishuAdapter;
 use health::HealthManager;
@@ -54,7 +61,7 @@ use telegram::TelegramAdapter;
 use types::{ImAttachmentType, ImBotStatus, ImConfig, ImConversation, ImMessage, ImPlatform, ImSourceType, ImStatus};
 
 /// Platform-agnostic adapter enum — avoids dyn dispatch overhead.
-enum AnyAdapter {
+pub(crate) enum AnyAdapter {
     Telegram(Arc<TelegramAdapter>),
     Feishu(Arc<FeishuAdapter>),
 }
@@ -171,20 +178,62 @@ pub struct ImBotInstance {
     platform: ImPlatform,
     shutdown_tx: watch::Sender<bool>,
     health: Arc<HealthManager>,
-    router: Arc<Mutex<SessionRouter>>,
+    pub(crate) router: Arc<Mutex<SessionRouter>>,
     buffer: Arc<Mutex<MessageBuffer>>,
     started_at: Instant,
     /// JoinHandle for the message processing loop (awaited during graceful shutdown)
     process_handle: tokio::task::JoinHandle<()>,
+    /// JoinHandle for the platform listen loop (long-poll / WebSocket)
+    poll_handle: tokio::task::JoinHandle<()>,
+    /// JoinHandle for the approval callback handler
+    approval_handle: tokio::task::JoinHandle<()>,
+    /// JoinHandle for the health persist loop
+    health_handle: tokio::task::JoinHandle<()>,
     /// Random bind code for QR code binding flow
     bind_code: String,
     #[allow(dead_code)]
     config: ImConfig,
+    // ===== Heartbeat (v0.1.21) =====
+    /// Heartbeat runner background task handle
+    heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Channel to send wake signals to heartbeat runner
+    pub heartbeat_wake_tx: Option<mpsc::Sender<types::WakeReason>>,
+    /// Shared heartbeat config (for hot updates)
+    heartbeat_config: Option<Arc<tokio::sync::RwLock<types::HeartbeatConfig>>>,
+    /// Platform adapter (retained for graceful shutdown — e.g. dedup flush)
+    adapter: Arc<AnyAdapter>,
+    // ===== Hot-reloadable config =====
+    pub(crate) current_model: Arc<tokio::sync::RwLock<Option<String>>>,
+    pub(crate) current_provider_env: Arc<tokio::sync::RwLock<Option<serde_json::Value>>>,
+    pub(crate) permission_mode: Arc<tokio::sync::RwLock<String>>,
+    pub(crate) mcp_servers_json: Arc<tokio::sync::RwLock<Option<String>>>,
+    pub(crate) available_providers_json: Arc<tokio::sync::RwLock<Option<String>>>,
+    pub(crate) allowed_users: Arc<tokio::sync::RwLock<Vec<String>>>,
 }
 
 /// Create the managed IM Bot state (called during app setup)
 pub fn create_im_bot_state() -> ManagedImBots {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Signal all running IM bots to shut down (sync, for use in app exit handlers).
+/// Best-effort: uses try_lock to avoid blocking if mutex is held.
+pub fn signal_all_bots_shutdown(im_state: &ManagedImBots) {
+    if let Ok(bots) = im_state.try_lock() {
+        for (bot_id, instance) in bots.iter() {
+            log::info!("[im] Signaling shutdown for bot {}", bot_id);
+            let _ = instance.shutdown_tx.send(true);
+            instance.poll_handle.abort();
+            instance.process_handle.abort();
+            instance.approval_handle.abort();
+            instance.health_handle.abort();
+            if let Some(ref h) = instance.heartbeat_handle {
+                h.abort();
+            }
+        }
+    } else {
+        log::warn!("[im] Could not acquire lock for shutdown signal, IM bots may linger");
+    }
 }
 
 /// Start the IM Bot
@@ -201,12 +250,18 @@ pub async fn start_im_bot<R: Runtime>(
     if let Some(instance) = im_guard.remove(&bot_id) {
         ulog_info!("[im] Stopping existing IM Bot {} before restart", bot_id);
         let _ = instance.shutdown_tx.send(true);
+        instance.poll_handle.abort(); // Cancel in-flight long-poll immediately
         // Wait briefly for in-flight messages (shorter timeout for restart)
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             instance.process_handle,
         )
         .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), instance.approval_handle).await;
+        if let Some(hb) = instance.heartbeat_handle {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), hb).await;
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), instance.health_handle).await;
         instance
             .router
             .lock()
@@ -284,12 +339,16 @@ pub async fn start_im_bot<R: Runtime>(
             Arc::clone(&allowed_users),
             approval_tx.clone(),
         )))),
-        ImPlatform::Feishu => Arc::new(AnyAdapter::Feishu(Arc::new(FeishuAdapter::new(
-            &config,
-            msg_tx,
-            Arc::clone(&allowed_users),
-            approval_tx.clone(),
-        )))),
+        ImPlatform::Feishu => {
+            let dedup_path = Some(health::bot_dedup_path(&bot_id));
+            Arc::new(AnyAdapter::Feishu(Arc::new(FeishuAdapter::new(
+                &config,
+                msg_tx,
+                Arc::clone(&allowed_users),
+                approval_tx.clone(),
+                dedup_path,
+            ))))
+        }
     };
 
     // Verify bot connection via ImAdapter + ImStreamAdapter traits
@@ -322,12 +381,12 @@ pub async fn start_im_bot<R: Runtime>(
     }
 
     // Start health persist loop
-    let _health_handle = health.start_persist_loop(shutdown_rx.clone());
+    let health_handle = health.start_persist_loop(shutdown_rx.clone());
 
     // Start Telegram long-poll loop
     let adapter_clone = Arc::clone(&adapter);
     let poll_shutdown_rx = shutdown_rx.clone();
-    let _poll_handle = tokio::spawn(async move {
+    let poll_handle = tokio::spawn(async move {
         adapter_clone.listen_loop(poll_shutdown_rx).await;
     });
 
@@ -335,8 +394,20 @@ pub async fn start_im_bot<R: Runtime>(
     let pending_approvals_for_handler = Arc::clone(&pending_approvals);
     let adapter_for_approval = Arc::clone(&adapter);
     let approval_client = Client::new();
-    let _approval_handle = tokio::spawn(async move {
-        while let Some(cb) = approval_rx.recv().await {
+    let mut approval_shutdown_rx = shutdown_rx.clone();
+    let approval_handle = tokio::spawn(async move {
+        loop {
+            let cb = tokio::select! {
+                msg = approval_rx.recv() => match msg {
+                    Some(cb) => cb,
+                    None => break, // Channel closed
+                },
+                _ = approval_shutdown_rx.changed() => {
+                    if *approval_shutdown_rx.borrow() { break; }
+                    continue;
+                }
+            };
+
             let pending = pending_approvals_for_handler.lock().await.remove(&cb.request_id);
             if let Some(p) = pending {
                 // POST decision to Sidecar
@@ -376,6 +447,11 @@ pub async fn start_im_bot<R: Runtime>(
         ulog_info!("[im] Approval handler exited");
     });
 
+    // Per-peer locks: shared between the processing loop and heartbeat runner.
+    // Both must acquire the lock for a session_key before calling Sidecar HTTP APIs,
+    // because /api/im/chat uses a single imStreamCallback — concurrent requests would conflict.
+    let peer_locks: PeerLocks = Arc::new(Mutex::new(HashMap::new()));
+
     // Start message processing loop
     //
     // Concurrency model:
@@ -385,6 +461,7 @@ pub async fn start_im_bot<R: Runtime>(
     //   Lock ordering (per task):
     //     1. Per-peer lock — serializes requests to the same Sidecar (required because
     //        /api/im/chat uses a single imStreamCallback; concurrent requests would conflict).
+    //        Heartbeat runner also acquires this lock to prevent callback conflicts.
     //     2. Global semaphore — limits total concurrent Sidecar I/O across all peers.
     //        Acquired AFTER the peer lock so queued same-peer tasks don't hold permits
     //        while waiting, which would starve other peers.
@@ -396,7 +473,7 @@ pub async fn start_im_bot<R: Runtime>(
     let adapter_for_reply = Arc::clone(&adapter);
     let app_clone = app_handle.clone();
     let manager_clone = Arc::clone(sidecar_manager);
-    let permission_mode = config.permission_mode.clone();
+    let permission_mode = Arc::new(tokio::sync::RwLock::new(config.permission_mode.clone()));
     // Parse provider env from config (for per-message forwarding to Sidecar)
     // Wrapped in RwLock so /provider command can update it at runtime
     let provider_env: Option<serde_json::Value> = config
@@ -404,23 +481,27 @@ pub async fn start_im_bot<R: Runtime>(
         .as_ref()
         .and_then(|json_str| serde_json::from_str(json_str).ok());
     let current_provider_env = Arc::new(tokio::sync::RwLock::new(provider_env));
-    // Available providers list (for /provider command menu)
-    let available_providers_json = config.available_providers_json.clone();
+    // Available providers list (for /provider command menu) — hot-reloadable
+    let available_providers_json = Arc::new(tokio::sync::RwLock::new(config.available_providers_json.clone()));
+    // MCP servers JSON — hot-reloadable
+    let mcp_servers_json = Arc::new(tokio::sync::RwLock::new(config.mcp_servers_json.clone()));
     let bind_code_for_loop = bind_code.clone();
     let bot_id_for_loop = bot_id.clone();
     let allowed_users_for_loop = Arc::clone(&allowed_users);
     let current_model_for_loop = Arc::clone(&current_model);
     let current_provider_env_for_loop = Arc::clone(&current_provider_env);
-    let available_providers_for_loop = available_providers_json.clone();
-    let mcp_servers_json_for_loop = config.mcp_servers_json.clone();
+    let available_providers_for_loop = Arc::clone(&available_providers_json);
+    let permission_mode_for_loop = Arc::clone(&permission_mode);
+    let mcp_servers_json_for_loop = Arc::clone(&mcp_servers_json);
     let pending_approvals_for_loop = Arc::clone(&pending_approvals);
     let approval_tx_for_loop = approval_tx.clone();
     let mut process_shutdown_rx = shutdown_rx.clone();
 
     // Concurrency primitives (live outside the router for lock-free access)
     let global_semaphore = Arc::new(Semaphore::new(GLOBAL_CONCURRENCY));
-    let peer_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    // peer_locks is created in start_im_bot() and shared with heartbeat runner;
+    // the Arc is cloned here for the processing loop.
+    let peer_locks_for_loop = Arc::clone(&peer_locks);
     let stream_client = create_sidecar_stream_client();
 
     let process_handle = tokio::spawn(async move {
@@ -564,6 +645,17 @@ pub async fn start_im_bot<R: Runtime>(
                     let is_telegram_bind = text.starts_with("/start BIND_");
                     let is_feishu_bind = text.starts_with("BIND_") && msg.platform == ImPlatform::Feishu;
                     if is_telegram_bind || is_feishu_bind {
+                        // If sender is already bound, silently ignore stale BIND_ messages
+                        // (Feishu may re-deliver old messages after bot restart clears dedup cache)
+                        let already_bound = {
+                            let users = allowed_users_for_loop.read().await;
+                            users.contains(&msg.sender_id)
+                        };
+                        if already_bound {
+                            ulog_debug!("[im] Ignoring stale BIND message from already-bound user {}", msg.sender_id);
+                            continue;
+                        }
+
                         let code = if is_telegram_bind {
                             text.strip_prefix("/start ").unwrap_or("")
                         } else {
@@ -618,12 +710,35 @@ pub async fn start_im_bot<R: Runtime>(
                             &chat_id,
                             "👋 你好！我是 MyAgents Bot。\n\n\
                              可用命令：\n\
+                             /help — 查看所有命令\n\
                              /new — 开始新对话\n\
                              /workspace <路径> — 切换工作区\n\
                              /model — 查看或切换 AI 模型\n\
                              /provider — 查看或切换 AI 供应商\n\
+                             /mode — 切换权限模式\n\
                              /status — 查看状态\n\n\
                              直接发消息即可开始对话。",
+                        ).await;
+                        continue;
+                    }
+
+                    if text == "/help" {
+                        let _ = adapter_for_reply.send_message(
+                            &chat_id,
+                            "📖 可用命令\n\n\
+                             /new — 开始新对话（清空当前上下文）\n\
+                             /workspace — 查看当前工作区\n\
+                             /workspace <路径> — 切换工作区目录\n\
+                             /model — 查看当前供应商的可用模型\n\
+                             /model <序号或模型ID> — 切换模型\n\
+                             /provider — 查看可用 AI 供应商\n\
+                             /provider <序号或ID> — 切换供应商\n\
+                             /mode — 查看当前权限模式\n\
+                             /mode <模式> — 切换模式（plan / auto / full）\n\
+                             /status — 查看会话状态\n\
+                             /help — 显示本帮助\n\n\
+                             💬 直接发送文字即可与 AI 对话。\n\
+                             🔒 工具审批：收到权限请求时，回复「允许」「始终允许」或「拒绝」。",
                         ).await;
                         continue;
                     }
@@ -697,49 +812,108 @@ pub async fn start_im_bot<R: Runtime>(
                         continue;
                     }
 
-                    // /model — show or switch AI model
+                    // /model — show or switch AI model (dynamic list from current provider)
                     if text.starts_with("/model") {
                         let arg = text.strip_prefix("/model").unwrap_or("").trim().to_string();
+
+                        // Find current provider's models from available_providers_json
+                        let models: Vec<serde_json::Value> = {
+                            let providers: Vec<serde_json::Value> = {
+                                let ap = available_providers_for_loop.read().await;
+                                ap.as_ref()
+                                    .and_then(|json| serde_json::from_str(json).ok())
+                                    .unwrap_or_default()
+                            };
+                            let current_env = current_provider_env_for_loop.read().await;
+                            let current_provider = if current_env.is_none() {
+                                // Subscription (Anthropic) — find provider whose id contains "sub"
+                                providers.iter().find(|p| {
+                                    p["id"].as_str().map(|s| s.contains("sub")).unwrap_or(false)
+                                }).cloned()
+                            } else {
+                                // Match by baseUrl
+                                let base_url = current_env.as_ref()
+                                    .and_then(|v| v["baseUrl"].as_str());
+                                providers.iter()
+                                    .find(|p| p["baseUrl"].as_str() == base_url)
+                                    .cloned()
+                            };
+                            current_provider
+                                .and_then(|p| p["models"].as_array().cloned())
+                                .unwrap_or_default()
+                        };
+
                         if arg.is_empty() {
                             let current = current_model_for_loop.read().await;
-                            let display = current.as_deref().unwrap_or("claude-sonnet-4-6 (默认)");
-                            let help = format!(
-                                "📊 当前模型: {}\n\n可用快捷名:\n\
-                                 • sonnet → claude-sonnet-4-6\n\
-                                 • opus → claude-opus-4-6\n\
-                                 • haiku → claude-haiku-4-5\n\n\
-                                 用法: /model <名称>",
-                                display,
-                            );
-                            let _ = adapter_for_reply.send_message(&chat_id, &help).await;
+                            let display = current.as_deref().unwrap_or("(默认)");
+
+                            if models.is_empty() {
+                                // Fallback: no models info available
+                                let help = format!(
+                                    "📊 当前模型: {}\n\n提示: 可直接输入模型 ID 切换\n用法: /model <模型ID>",
+                                    display,
+                                );
+                                let _ = adapter_for_reply.send_message(&chat_id, &help).await;
+                            } else {
+                                let mut menu = format!("📊 当前模型: {}\n\n可用模型:\n", display);
+                                for (i, m) in models.iter().enumerate() {
+                                    let model_id = m["model"].as_str().unwrap_or("?");
+                                    let model_name = m["modelName"].as_str().unwrap_or(model_id);
+                                    menu.push_str(&format!("{}. {} ({})\n", i + 1, model_name, model_id));
+                                }
+                                menu.push_str("\n用法: /model <序号或模型ID>");
+                                let _ = adapter_for_reply.send_message(&chat_id, &menu).await;
+                            }
                         } else {
-                            let model_id = match arg.to_lowercase().as_str() {
-                                "sonnet" => "claude-sonnet-4-6".to_string(),
-                                "opus" => "claude-opus-4-6".to_string(),
-                                "haiku" => "claude-haiku-4-5".to_string(),
-                                other => other.to_string(),
+                            // Resolve target model: by index (1-based) or by model ID
+                            let model_id = if let Ok(idx) = arg.parse::<usize>() {
+                                if idx == 0 {
+                                    None // invalid: 1-based index
+                                } else {
+                                    models.get(idx - 1)
+                                        .and_then(|m| m["model"].as_str())
+                                        .map(|s| s.to_string())
+                                }
+                            } else {
+                                Some(arg) // accept any string as model ID
                             };
-                            // Update shared model state
-                            {
-                                let mut model_guard = current_model_for_loop.write().await;
-                                *model_guard = Some(model_id.clone());
+
+                            match model_id {
+                                Some(id) => {
+                                    // Update shared model state
+                                    {
+                                        let mut model_guard = current_model_for_loop.write().await;
+                                        *model_guard = Some(id.clone());
+                                    }
+                                    // If peer has an active Sidecar, log it
+                                    let router = router_clone.lock().await;
+                                    let sessions = router.active_sessions();
+                                    if let Some(s) = sessions.iter().find(|s| s.session_key == session_key) {
+                                        drop(router);
+                                        ulog_info!("[im] /model: set to {} (session={})", id, s.session_key);
+                                    }
+                                    let _ = adapter_for_reply.send_message(
+                                        &chat_id,
+                                        &format!("✅ 模型已切换为: {}", id),
+                                    ).await;
+
+                                    // Persist to config.json + notify frontend
+                                    let bid = bot_id_for_loop.clone();
+                                    let model_str = id.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        persist_ai_config_to_disk(&bid, Some(&model_str), None, None);
+                                    });
+                                    let _ = app_clone.emit("im:ai-config-changed", json!({
+                                        "botId": bot_id_for_loop,
+                                    }));
+                                }
+                                None => {
+                                    let _ = adapter_for_reply.send_message(
+                                        &chat_id,
+                                        "❌ 无效的序号，请使用 /model 查看可用列表",
+                                    ).await;
+                                }
                             }
-                            // If peer has an active Sidecar, sync model via API
-                            let router = router_clone.lock().await;
-                            let sessions = router.active_sessions();
-                            if let Some(s) = sessions.iter().find(|s| s.session_key == session_key) {
-                                // Parse port from peer sessions (need to check via ensure_sidecar route)
-                                // Active sessions don't expose port directly, so use the http client
-                                // We'll sync on next message via ensure_sidecar + sync_ai_config pattern
-                                drop(router);
-                                // Attempt to sync if we can find the port
-                                // For now, the model will be picked up when session restarts
-                                ulog_info!("[im] /model: set to {} (session={})", model_id, s.session_key);
-                            }
-                            let _ = adapter_for_reply.send_message(
-                                &chat_id,
-                                &format!("✅ 模型已切换为: {}", model_id),
-                            ).await;
                         }
                         continue;
                     }
@@ -748,11 +922,13 @@ pub async fn start_im_bot<R: Runtime>(
                     if text.starts_with("/provider") {
                         let arg = text.strip_prefix("/provider").unwrap_or("").trim().to_string();
 
-                        // Parse available providers from startup config
-                        let providers: Vec<serde_json::Value> = available_providers_for_loop
-                            .as_ref()
-                            .and_then(|json| serde_json::from_str(json).ok())
-                            .unwrap_or_default();
+                        // Parse available providers from config (hot-reloadable)
+                        let providers: Vec<serde_json::Value> = {
+                            let ap = available_providers_for_loop.read().await;
+                            ap.as_ref()
+                                .and_then(|json| serde_json::from_str(json).ok())
+                                .unwrap_or_default()
+                        };
 
                         if arg.is_empty() {
                             // Show current provider + available list
@@ -796,27 +972,48 @@ pub async fn start_im_bot<R: Runtime>(
                                     let provider_id = provider["id"].as_str().unwrap_or("");
 
                                     // Subscription provider → clear provider env
-                                    if provider_id.contains("sub") {
+                                    let (penv_json, pid_str): (Option<String>, Option<String>) = if provider_id.contains("sub") {
                                         *current_provider_env_for_loop.write().await = None;
+                                        (Some(String::new()), Some(String::new())) // empty = clear
                                     } else {
-                                        // Build new provider env from stored info
+                                        // Build new provider env from stored info (include apiProtocol)
                                         let new_env = serde_json::json!({
                                             "baseUrl": provider["baseUrl"],
                                             "apiKey": provider["apiKey"],
                                             "authType": provider["authType"],
+                                            "apiProtocol": provider["apiProtocol"],
                                         });
+                                        let env_str = new_env.to_string();
                                         *current_provider_env_for_loop.write().await = Some(new_env);
-                                    }
+                                        (Some(env_str), Some(provider_id.to_string()))
+                                    };
 
                                     // Also switch model to the provider's primary model
-                                    if !primary_model.is_empty() {
+                                    let model_for_persist = if !primary_model.is_empty() {
                                         *current_model_for_loop.write().await = Some(primary_model.to_string());
-                                    }
+                                        Some(primary_model.to_string())
+                                    } else {
+                                        None
+                                    };
 
                                     let _ = adapter_for_reply.send_message(
                                         &chat_id,
                                         &format!("✅ 已切换供应商: {}\n模型: {}", name, primary_model),
                                     ).await;
+
+                                    // Persist to config.json + notify frontend
+                                    let bid = bot_id_for_loop.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        persist_ai_config_to_disk(
+                                            &bid,
+                                            model_for_persist.as_deref(),
+                                            penv_json.as_deref(),
+                                            pid_str.as_deref(),
+                                        );
+                                    });
+                                    let _ = app_clone.emit("im:ai-config-changed", json!({
+                                        "botId": bot_id_for_loop,
+                                    }));
                                 }
                                 None => {
                                     let _ = adapter_for_reply.send_message(
@@ -825,6 +1022,60 @@ pub async fn start_im_bot<R: Runtime>(
                                     ).await;
                                 }
                             }
+                        }
+                        continue;
+                    }
+
+                    // /mode — show or switch permission mode
+                    if text.starts_with("/mode") {
+                        let arg = text.strip_prefix("/mode").unwrap_or("").trim().to_lowercase();
+                        let current = permission_mode_for_loop.read().await.clone();
+
+                        if arg.is_empty() {
+                            let display = match current.as_str() {
+                                "plan" => "🛡 计划模式 (plan) — AI 执行操作前需要审批",
+                                "auto" => "⚡ 自动模式 (auto) — 安全操作自动执行，敏感操作需审批",
+                                "fullAgency" => "🚀 全自主模式 (fullAgency) — 所有操作自动执行",
+                                _ => "❓ 未知模式",
+                            };
+                            let _ = adapter_for_reply.send_message(
+                                &chat_id,
+                                &format!(
+                                    "🔐 当前权限模式\n\n{}\n\n\
+                                     可选模式：\n\
+                                     • plan — 计划模式（最安全）\n\
+                                     • auto — 自动模式（推荐）\n\
+                                     • full — 全自主模式\n\n\
+                                     用法: /mode <模式>",
+                                    display,
+                                ),
+                            ).await;
+                        } else {
+                            let new_mode = match arg.as_str() {
+                                "plan" => "plan",
+                                "auto" => "auto",
+                                "full" | "fullagency" => "fullAgency",
+                                _ => {
+                                    let _ = adapter_for_reply.send_message(
+                                        &chat_id,
+                                        "❌ 无效模式，可选: plan / auto / full",
+                                    ).await;
+                                    continue;
+                                }
+                            };
+                            *permission_mode_for_loop.write().await = new_mode.to_string();
+
+                            let display = match new_mode {
+                                "plan" => "🛡 计划模式 — AI 执行操作前需要审批",
+                                "auto" => "⚡ 自动模式 — 安全操作自动执行",
+                                "fullAgency" => "🚀 全自主模式 — 所有操作自动执行",
+                                _ => unreachable!(),
+                            };
+                            ulog_info!("[im] /mode: switched to {} (session={})", new_mode, session_key);
+                            let _ = adapter_for_reply.send_message(
+                                &chat_id,
+                                &format!("✅ 权限模式已切换\n\n{}", display),
+                            ).await;
                         }
                         continue;
                     }
@@ -871,14 +1122,15 @@ pub async fn start_im_bot<R: Runtime>(
                     let task_manager = Arc::clone(&manager_clone);
                     let task_buffer = Arc::clone(&buffer_clone);
                     let task_health = Arc::clone(&health_clone);
-                    let task_perm = permission_mode.clone();
+                    let task_perm = permission_mode_for_loop.read().await.clone();
                     let task_provider_env = Arc::clone(&current_provider_env_for_loop);
                     let task_model = Arc::clone(&current_model_for_loop);
-                    let task_mcp_json = mcp_servers_json_for_loop.clone();
+                    let task_mcp_json = mcp_servers_json_for_loop.read().await.clone();
                     let task_stream_client = stream_client.clone();
                     let task_sem = Arc::clone(&global_semaphore);
-                    let task_locks = Arc::clone(&peer_locks);
+                    let task_locks = Arc::clone(&peer_locks_for_loop);
                     let task_pending_approvals = Arc::clone(&pending_approvals_for_loop);
+                    let task_bot_id = bot_id_for_loop.clone();
 
                     in_flight.spawn(async move {
                         // 1. Acquire per-peer lock FIRST (serialize requests to same Sidecar).
@@ -951,6 +1203,7 @@ pub async fn start_im_bot<R: Runtime>(
 
                         // 5. SSE stream: route message + stream response to Telegram
                         let penv = task_provider_env.read().await.clone();
+                        let task_model_val = task_model.read().await.clone();
                         let images = if image_payloads.is_empty() {
                             None
                         } else {
@@ -964,8 +1217,10 @@ pub async fn start_im_bot<R: Runtime>(
                             &chat_id,
                             &task_perm,
                             penv.as_ref(),
+                            task_model_val.as_deref(),
                             images,
                             &task_pending_approvals,
+                            Some(&task_bot_id),
                         )
                         .await
                         {
@@ -982,11 +1237,20 @@ pub async fn start_im_bot<R: Runtime>(
                                 if e.should_buffer() {
                                     task_buffer.lock().await.push(&msg);
                                 }
-                                // SSE "error" events are handled inside stream_to_telegram,
-                                // but early failures (connection refused, non-200 status) need
-                                // explicit notification here.
+                                // Format user-friendly error: SSE errors from Bun are already
+                                // localized via localizeImError, extract the inner message
+                                // instead of wrapping with "处理消息时出错" again.
+                                // RouteError::Response displays as "Sidecar returned {status}: {body}"
+                                let e_str = format!("{}", e);
+                                let user_msg = if e_str.starts_with("Sidecar returned ") {
+                                    // Extract body after "Sidecar returned NNN: "
+                                    let inner = e_str.splitn(2, ": ").nth(1).unwrap_or(&e_str);
+                                    format!("⚠️ {}", inner)
+                                } else {
+                                    format!("⚠️ {}", e)
+                                };
                                 let _ = task_adapter
-                                    .send_message(&chat_id, &format!("⚠️ 处理消息时出错: {}", e))
+                                    .send_message(&chat_id, &user_msg)
                                     .await;
                                 task_adapter.ack_clear(&chat_id, &message_id).await;
                                 return;
@@ -997,10 +1261,17 @@ pub async fn start_im_bot<R: Runtime>(
                         task_adapter.ack_clear(&chat_id, &message_id).await;
 
                         // 7. Update session state
-                        task_router
-                            .lock()
-                            .await
-                            .record_response(&session_key, session_id.as_deref());
+                        {
+                            let mut router = task_router.lock().await;
+                            router.record_response(&session_key, session_id.as_deref());
+                            // If Bun sidecar created a new session (e.g. provider switch),
+                            // upgrade the Rust-side session_id + Sidecar Manager key
+                            if let Some(new_sid) = session_id.as_deref() {
+                                router.upgrade_peer_session_id(
+                                    &session_key, new_sid, &task_manager,
+                                );
+                            }
+                        }
 
                         // Update health
                         task_health
@@ -1028,19 +1299,25 @@ pub async fn start_im_bot<R: Runtime>(
                                         &buf_chat_id,
                                         &task_perm,
                                         penv.as_ref(),
+                                        task_model_val.as_deref(),
                                         None, // buffered messages don't preserve attachments
                                         &task_pending_approvals,
+                                        Some(&task_bot_id),
                                     )
                                     .await
                                     {
                                         Ok(buf_sid) => {
-                                            task_router
-                                                .lock()
-                                                .await
-                                                .record_response(
-                                                    &session_key,
-                                                    buf_sid.as_deref(),
+                                            let mut router = task_router.lock().await;
+                                            router.record_response(
+                                                &session_key,
+                                                buf_sid.as_deref(),
+                                            );
+                                            if let Some(sid) = buf_sid.as_deref() {
+                                                router.upgrade_peer_session_id(
+                                                    &session_key, sid, &task_manager,
                                                 );
+                                            }
+                                            drop(router);
                                             replayed += 1;
                                         }
                                         Err(e) => {
@@ -1161,7 +1438,7 @@ pub async fn start_im_bot<R: Runtime>(
     };
 
     let status = ImBotStatus {
-        bot_username: bot_username_for_url,
+        bot_username: bot_username_for_url.clone(),
         status: ImStatus::Online,
         uptime_seconds: 0,
         last_message_at: None,
@@ -1171,6 +1448,41 @@ pub async fn start_im_bot<R: Runtime>(
         buffered_messages: buffer.lock().await.len(),
         bind_url,
         bind_code: bind_code_for_status,
+    };
+
+    // ===== Heartbeat Runner (v0.1.21) =====
+    let (heartbeat_handle, heartbeat_wake_tx, heartbeat_config_arc) = {
+        let hb_config = config.heartbeat_config.clone().unwrap_or_default();
+        let hb_bot_label = bot_username_for_url.clone().unwrap_or_else(|| bot_id.to_string());
+        let (runner, config_arc) = heartbeat::HeartbeatRunner::new(
+            hb_config,
+            hb_bot_label,
+            Arc::clone(&current_model),
+            Arc::clone(&mcp_servers_json),
+        );
+        let (wake_tx, wake_rx) = mpsc::channel::<types::WakeReason>(64);
+
+        let hb_shutdown_rx = shutdown_rx.clone();
+        let hb_router = Arc::clone(&router);
+        let hb_sidecar = Arc::clone(sidecar_manager);
+        let hb_adapter = Arc::clone(&adapter);
+        let hb_app = app_handle.clone();
+        let hb_peer_locks = Arc::clone(&peer_locks);
+
+        let handle = tokio::spawn(async move {
+            runner.run_loop(
+                hb_shutdown_rx,
+                wake_rx,
+                hb_router,
+                hb_sidecar,
+                hb_adapter,
+                hb_app,
+                hb_peer_locks,
+            ).await;
+        });
+
+        ulog_info!("[im] Heartbeat runner spawned for bot {}", bot_id);
+        (Some(handle), Some(wake_tx), Some(config_arc))
     };
 
     // Store instance
@@ -1184,8 +1496,22 @@ pub async fn start_im_bot<R: Runtime>(
         buffer,
         started_at,
         process_handle,
+        poll_handle,
+        approval_handle,
+        health_handle,
         bind_code,
         config,
+        heartbeat_handle,
+        heartbeat_wake_tx,
+        heartbeat_config: heartbeat_config_arc,
+        adapter: Arc::clone(&adapter),
+        // Hot-reloadable config (Arc clones shared with processing loop)
+        current_model,
+        current_provider_env,
+        permission_mode,
+        mcp_servers_json,
+        available_providers_json,
+        allowed_users,
     });
 
     Ok(status)
@@ -1205,6 +1531,11 @@ pub async fn stop_im_bot(
         // Signal shutdown to all loops
         let _ = instance.shutdown_tx.send(true);
 
+        // Abort poll_handle to cancel in-flight long-poll HTTP request immediately.
+        // Without this, the old getUpdates request hangs for up to 30s on Telegram servers,
+        // causing 409 Conflict errors if the bot is restarted quickly.
+        instance.poll_handle.abort();
+
         // Wait for in-flight messages to finish (graceful: up to 10s)
         match tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -1216,9 +1547,22 @@ pub async fn stop_im_bot(
             Err(_) => ulog_warn!("[im] Processing loop did not exit within 10s, proceeding with shutdown"),
         }
 
+        // Wait for auxiliary tasks to finish (short timeout — already signaled via shutdown_tx)
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), instance.approval_handle).await;
+        if let Some(hb) = instance.heartbeat_handle {
+            // Heartbeat runner may be mid-HTTP-call; wait before releasing Sidecars
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), hb).await;
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), instance.health_handle).await;
+
         // Persist remaining buffered messages to disk
         if let Err(e) = instance.buffer.lock().await.save_to_disk() {
             ulog_warn!("[im] Failed to persist buffer on shutdown: {}", e);
+        }
+
+        // Flush dedup cache to disk (Feishu only — ensures last entries survive restart)
+        if let AnyAdapter::Feishu(ref feishu) = *instance.adapter {
+            feishu.flush_dedup_cache().await;
         }
 
         // Persist active sessions in health state before releasing Sidecars
@@ -1332,8 +1676,10 @@ async fn stream_to_im<A: adapter::ImStreamAdapter>(
     chat_id: &str,
     permission_mode: &str,
     provider_env: Option<&serde_json::Value>,
+    model: Option<&str>,
     images: Option<&Vec<serde_json::Value>>,
     pending_approvals: &PendingApprovals,
+    bot_id: Option<&str>,
 ) -> Result<Option<String>, RouteError> {
     // Build request body (same as original route_to_sidecar)
     let source = match (&msg.platform, &msg.source_type) {
@@ -1352,10 +1698,16 @@ async fn stream_to_im<A: adapter::ImStreamAdapter>(
     if let Some(env) = provider_env {
         body["providerEnv"] = env.clone();
     }
+    if let Some(m) = model {
+        body["model"] = json!(m);
+    }
     if let Some(imgs) = images {
         if !imgs.is_empty() {
             body["images"] = json!(imgs);
         }
+    }
+    if let Some(bid) = bot_id {
+        body["botId"] = json!(bid);
     }
     let url = format!("http://127.0.0.1:{}/api/im/chat", port);
     ulog_info!("[im-stream] POST {} (SSE)", url);
@@ -1382,6 +1734,12 @@ async fn stream_to_im<A: adapter::ImStreamAdapter>(
     let mut draft_id: Option<String> = None;
     let mut last_edit = Instant::now();
     let mut any_text_sent = false;
+
+    // Response-level placeholder state:
+    // - placeholder_id: message ID of "🤖 生成中..." sent when first block is non-text
+    // - first_content_sent: true once user has seen any content (placeholder or real text)
+    let mut placeholder_id: Option<String> = None;
+    let mut first_content_sent = false;
 
     let mut session_id: Option<String> = None;
     const THROTTLE: Duration = Duration::from_millis(1000);
@@ -1415,16 +1773,29 @@ async fn stream_to_im<A: adapter::ImStreamAdapter>(
                     if let Some(text) = json_val["text"].as_str() {
                         block_text = text.to_string();
 
-                        // First meaningful text received → send draft message
+                        // First meaningful text in this block → create or adopt draft
                         // Skip whitespace-only blocks (API spacer blocks before thinking)
                         if draft_id.is_none() && !block_text.trim().is_empty() {
-                            match adapter.send_message_returning_id(chat_id, "🤖 生成中...").await {
-                                Ok(Some(id)) => {
-                                    draft_id = Some(id);
-                                    last_edit = Instant::now();
+                            if let Some(pid) = placeholder_id.take() {
+                                // Adopt the placeholder as draft → edit with real content
+                                draft_id = Some(pid);
+                                let display = format_draft_text(&block_text, adapter.max_message_length());
+                                if let Err(e) = adapter.edit_message(chat_id, draft_id.as_ref().unwrap(), &display).await {
+                                    ulog_warn!("[im] Placeholder→draft edit failed: {}", e);
                                 }
-                                _ => {} // draft creation failed; block-end will send_message directly
+                                last_edit = Instant::now();
+                            } else {
+                                // No placeholder — send real content directly as draft
+                                let display = format_draft_text(&block_text, adapter.max_message_length());
+                                match adapter.send_message_returning_id(chat_id, &display).await {
+                                    Ok(Some(id)) => {
+                                        draft_id = Some(id);
+                                        last_edit = Instant::now();
+                                    }
+                                    _ => {} // draft creation failed; block-end will send_message directly
+                                }
                             }
+                            first_content_sent = true;
                         }
 
                         // Throttled edit (≥1s interval)
@@ -1437,6 +1808,19 @@ async fn stream_to_im<A: adapter::ImStreamAdapter>(
                                 last_edit = Instant::now();
                             }
                         }
+                    }
+                }
+                "activity" => {
+                    // Non-text block started (thinking, tool_use).
+                    // If user hasn't seen any content yet, send a placeholder.
+                    if !first_content_sent {
+                        match adapter.send_message_returning_id(chat_id, "🤖 生成中...").await {
+                            Ok(Some(id)) => {
+                                placeholder_id = Some(id);
+                            }
+                            _ => {} // placeholder failed; text blocks will create their own message
+                        }
+                        first_content_sent = true;
                     }
                 }
                 "block-end" => {
@@ -1468,6 +1852,10 @@ async fn stream_to_im<A: adapter::ImStreamAdapter>(
                         let _ = adapter.delete_message(chat_id, did).await;
                     }
                     if !any_text_sent {
+                        // Clean up orphaned placeholder (e.g. only thinking/tool_use, no text output)
+                        if let Some(ref pid) = placeholder_id {
+                            let _ = adapter.delete_message(chat_id, pid).await;
+                        }
                         let _ = adapter.send_message(chat_id, "(No response)").await;
                     }
                     return Ok(session_id);
@@ -1514,13 +1902,14 @@ async fn stream_to_im<A: adapter::ImStreamAdapter>(
                     let error = json_val["error"]
                         .as_str()
                         .unwrap_or("Unknown error");
-                    // Delete current draft if exists
+                    // Delete current draft and placeholder if they exist
                     if let Some(ref did) = draft_id {
                         let _ = adapter.delete_message(chat_id, did).await;
                     }
-                    let _ = adapter
-                        .send_message(chat_id, &format!("⚠️ {}", error))
-                        .await;
+                    if let Some(ref pid) = placeholder_id {
+                        let _ = adapter.delete_message(chat_id, pid).await;
+                    }
+                    // Don't send_message here — outer handler will do it
                     return Err(RouteError::Response(500, error.to_string()));
                 }
                 _ => {} // Ignore unknown types
@@ -1536,6 +1925,9 @@ async fn stream_to_im<A: adapter::ImStreamAdapter>(
         let _ = adapter.delete_message(chat_id, did).await;
     }
     if !any_text_sent {
+        if let Some(ref pid) = placeholder_id {
+            let _ = adapter.delete_message(chat_id, pid).await;
+        }
         let _ = adapter.send_message(chat_id, "(No response)").await;
     }
     Ok(session_id)
@@ -1570,20 +1962,20 @@ async fn finalize_block<A: adapter::ImStreamAdapter>(
     }
 }
 
-/// Format draft display text (truncate + generating indicator).
+/// Format draft display text (truncate if needed for platform limit).
 /// `max_len` is the platform's message limit (e.g. 4096 for Telegram, 30000 for Feishu).
 fn format_draft_text(text: &str, max_len: usize) -> String {
-    // Reserve space for the suffix
-    let limit = max_len.saturating_sub(100);
+    // Reserve a small margin for the "..." truncation indicator
+    let limit = max_len.saturating_sub(10);
     if text.chars().count() > limit {
         let truncate_at = text
             .char_indices()
             .nth(limit)
             .map(|(i, _)| i)
             .unwrap_or(text.len());
-        format!("{}...\n\n_⏳ 生成中_", &text[..truncate_at])
+        format!("{}...", &text[..truncate_at])
     } else {
-        format!("{}\n\n_⏳ 生成中_", text)
+        text.to_string()
     }
 }
 
@@ -1636,6 +2028,9 @@ struct PartialAppConfig {
     im_bot_config: Option<PartialBotEntry>,
     /// Multi-bot configs (v0.1.19+)
     im_bot_configs: Option<Vec<PartialBotEntry>>,
+    /// API keys keyed by provider ID (for migrating providerEnvJson)
+    #[serde(default)]
+    provider_api_keys: std::collections::HashMap<String, String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1728,9 +2123,10 @@ fn read_im_configs_from_disk() -> Vec<(String, ImConfig)> {
 }
 
 /// Extract (bot_id, config) pairs from parsed config.
+/// Migrates missing `provider_env_json` from `provider_api_keys` + preset baseUrl map.
 fn parse_bot_entries(app_config: PartialAppConfig) -> Vec<(String, ImConfig)> {
-    // Prefer multi-bot configs, fall back to legacy single-bot
-    if let Some(bots) = app_config.im_bot_configs {
+    let api_keys = app_config.provider_api_keys;
+    let mut entries: Vec<(String, ImConfig)> = if let Some(bots) = app_config.im_bot_configs {
         bots.into_iter()
             .map(|entry| {
                 let id = entry.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -1742,7 +2138,64 @@ fn parse_bot_entries(app_config: PartialAppConfig) -> Vec<(String, ImConfig)> {
         vec![(id, entry.config)]
     } else {
         Vec::new()
+    };
+
+    // Migration: rebuild providerEnvJson for bots that have providerId but no providerEnvJson
+    for (_id, config) in &mut entries {
+        migrate_provider_env(config, &api_keys);
     }
+
+    entries
+}
+
+/// Backward-compat migration: if a bot has `provider_id` set but `provider_env_json` is missing,
+/// reconstruct it from `providerApiKeys` + preset provider baseUrl map.
+/// This handles existing configs created before providerEnvJson persistence was added.
+fn migrate_provider_env(
+    config: &mut ImConfig,
+    api_keys: &std::collections::HashMap<String, String>,
+) {
+    if config.provider_env_json.is_some() {
+        return; // Already set
+    }
+    let provider_id = match &config.provider_id {
+        Some(id) if !id.is_empty() && !id.contains("sub") => id.clone(),
+        _ => return, // Subscription or no provider
+    };
+    let api_key = match api_keys.get(&provider_id) {
+        Some(key) if !key.is_empty() => key,
+        _ => return, // No API key available
+    };
+    let base_url = match provider_id.as_str() {
+        "anthropic-api" => "https://api.anthropic.com",
+        "deepseek" => "https://api.deepseek.com/anthropic",
+        "moonshot" => "https://api.moonshot.cn/anthropic",
+        "zhipu" => "https://open.bigmodel.cn/api/anthropic",
+        "minimax" => "https://api.minimaxi.com/anthropic",
+        "volcengine" => "https://ark.cn-beijing.volces.com/api/coding",
+        "siliconflow" => "https://api.siliconflow.cn/",
+        "zenmux" => "https://zenmux.ai/api/anthropic",
+        "openrouter" => "https://openrouter.ai/api",
+        _ => {
+            ulog_warn!(
+                "[im] Cannot migrate providerEnvJson for unknown provider '{}' — manual restart required",
+                provider_id
+            );
+            return;
+        }
+    };
+    config.provider_env_json = Some(
+        serde_json::json!({
+            "baseUrl": base_url,
+            "apiKey": api_key,
+            "authType": "api-key",
+        })
+        .to_string(),
+    );
+    ulog_info!(
+        "[im] Migrated providerEnvJson for provider '{}' from providerApiKeys",
+        provider_id
+    );
 }
 
 /// Persist a newly bound user to `~/.myagents/config.json`.
@@ -1844,6 +2297,112 @@ fn persist_bound_user_to_config(bot_id: &str, user_id: &str) {
     ulog_info!("[im] Persisted bound user {} for bot {} to config.json", user_id, bot_id);
 }
 
+/// Persist AI config changes (model / providerEnvJson / providerId) to `~/.myagents/config.json`.
+///
+/// Each `Option` parameter: `None` = leave unchanged, `Some("")` = clear the field,
+/// `Some(value)` = set the field.  Uses the same atomic write pattern as `persist_bound_user_to_config`.
+fn persist_ai_config_to_disk(
+    bot_id: &str,
+    model: Option<&str>,
+    provider_env_json: Option<&str>,
+    provider_id: Option<&str>,
+) {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => {
+            ulog_warn!("[im] Cannot persist AI config: home dir not found");
+            return;
+        }
+    };
+    let config_path = home.join(".myagents").join("config.json");
+    let tmp_path = config_path.with_extension("json.tmp.rust");
+    let bak_path = config_path.with_extension("json.bak");
+
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            ulog_warn!("[im] Cannot read config.json to persist AI config: {}", e);
+            return;
+        }
+    };
+    let mut config: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            ulog_warn!("[im] Cannot parse config.json to persist AI config: {}", e);
+            return;
+        }
+    };
+
+    let modified = if let Some(bots) = config.get_mut("imBotConfigs").and_then(|v| v.as_array_mut()) {
+        if let Some(bot) = bots.iter_mut().find(|b| b.get("id").and_then(|v| v.as_str()) == Some(bot_id)) {
+            let mut changed = false;
+            if let Some(m) = model {
+                if m.is_empty() {
+                    if let Some(o) = bot.as_object_mut() { o.remove("model"); }
+                } else {
+                    bot["model"] = serde_json::json!(m);
+                }
+                changed = true;
+            }
+            if let Some(penv) = provider_env_json {
+                if penv.is_empty() {
+                    if let Some(o) = bot.as_object_mut() { o.remove("providerEnvJson"); }
+                } else {
+                    bot["providerEnvJson"] = serde_json::json!(penv);
+                }
+                changed = true;
+            }
+            if let Some(pid) = provider_id {
+                if pid.is_empty() {
+                    if let Some(o) = bot.as_object_mut() { o.remove("providerId"); }
+                } else {
+                    bot["providerId"] = serde_json::json!(pid);
+                }
+                changed = true;
+            }
+            changed
+        } else {
+            ulog_warn!("[im] Bot {} not found in config.json, cannot persist AI config", bot_id);
+            false
+        }
+    } else {
+        ulog_warn!("[im] No imBotConfigs in config.json, cannot persist AI config");
+        false
+    };
+
+    if !modified {
+        return;
+    }
+
+    let new_content = match serde_json::to_string_pretty(&config) {
+        Ok(c) => c,
+        Err(e) => {
+            ulog_warn!("[im] Cannot serialize config for AI config: {}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = std::fs::write(&tmp_path, &new_content) {
+        ulog_warn!("[im] Cannot write tmp config for AI config: {}", e);
+        return;
+    }
+
+    if config_path.exists() {
+        let _ = std::fs::rename(&config_path, &bak_path);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, &config_path) {
+        ulog_warn!("[im] Cannot rename tmp config for AI config: {}", e);
+        if bak_path.exists() && !config_path.exists() {
+            let _ = std::fs::rename(&bak_path, &config_path);
+        }
+        return;
+    }
+
+    ulog_info!("[im] Persisted AI config for bot {} to config.json (model={:?}, provider={:?})",
+        bot_id, model, provider_id);
+}
+
 // ===== Tauri Commands =====
 
 #[tauri::command]
@@ -1864,11 +2423,16 @@ pub async fn cmd_start_im_bot(
     platform: Option<String>,
     feishuAppId: Option<String>,
     feishuAppSecret: Option<String>,
+    heartbeatConfigJson: Option<String>,
 ) -> Result<ImBotStatus, String> {
     let im_platform = match platform.as_deref() {
         Some("feishu") => ImPlatform::Feishu,
         _ => ImPlatform::Telegram,
     };
+    let heartbeat_config = heartbeatConfigJson
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "null")
+        .and_then(|s| serde_json::from_str::<types::HeartbeatConfig>(s).ok());
     let config = ImConfig {
         platform: im_platform,
         bot_token: botToken,
@@ -1878,10 +2442,12 @@ pub async fn cmd_start_im_bot(
         enabled: true,
         feishu_app_id: feishuAppId,
         feishu_app_secret: feishuAppSecret,
+        provider_id: None, // Not needed here — frontend passes providerEnvJson directly
         model,
         provider_env_json: providerEnvJson,
         mcp_servers_json: mcpServersJson,
         available_providers_json: availableProvidersJson,
+        heartbeat_config,
     };
 
     start_im_bot(
@@ -1951,4 +2517,170 @@ pub async fn cmd_im_conversations(
     } else {
         Ok(Vec::new())
     }
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn cmd_update_heartbeat_config(
+    imState: tauri::State<'_, ManagedImBots>,
+    botId: String,
+    heartbeatConfigJson: String,
+) -> Result<(), String> {
+    let new_config: types::HeartbeatConfig = serde_json::from_str(&heartbeatConfigJson)
+        .map_err(|e| format!("Invalid heartbeat config JSON: {}", e))?;
+
+    let im_guard = imState.lock().await;
+    if let Some(instance) = im_guard.get(&botId) {
+        if let Some(ref config_arc) = instance.heartbeat_config {
+            let mut cfg = config_arc.write().await;
+            *cfg = new_config;
+            ulog_info!("[im] Heartbeat config updated for bot {}", botId);
+            Ok(())
+        } else {
+            Err(format!("Bot {} has no heartbeat runner", botId))
+        }
+    } else {
+        Err(format!("Bot {} not found", botId))
+    }
+}
+
+/// Hot-update AI config (model + provider env + available providers) for a running bot.
+/// Model is synced to all active Sidecars via POST /api/model/set (SDK hot-switch).
+/// Provider env is updated in memory — next message automatically uses the new value.
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn cmd_update_im_bot_ai_config(
+    imState: tauri::State<'_, ManagedImBots>,
+    botId: String,
+    model: Option<String>,
+    providerEnvJson: Option<String>,
+    availableProvidersJson: Option<String>,
+) -> Result<(), String> {
+    let (router, current_model, current_provider_env, available_providers) = {
+        let bots = imState.lock().await;
+        let inst = bots.get(&botId).ok_or("Bot not found or not running")?;
+        (
+            Arc::clone(&inst.router),
+            Arc::clone(&inst.current_model),
+            Arc::clone(&inst.current_provider_env),
+            Arc::clone(&inst.available_providers_json),
+        )
+    };
+
+    // Selective update: None = don't change, Some("") = clear, Some(json) = set.
+    // This allows model-only updates without wiping provider config.
+    if let Some(ref m) = model {
+        *current_model.write().await = if m.is_empty() { None } else { Some(m.clone()) };
+    }
+    if let Some(ref s) = providerEnvJson {
+        if s.is_empty() {
+            *current_provider_env.write().await = None;
+        } else {
+            let penv = serde_json::from_str(s).ok();
+            *current_provider_env.write().await = penv;
+        }
+    }
+    if let Some(ref s) = availableProvidersJson {
+        if s.is_empty() {
+            *available_providers.write().await = None;
+        } else {
+            *available_providers.write().await = Some(s.clone());
+        }
+    }
+
+    // Sync model to all active Sidecars (SDK hot-switch, no session restart needed)
+    if model.is_some() {
+        let router = router.lock().await;
+        for port in router.active_sidecar_ports() {
+            router.sync_ai_config(port, model.as_deref(), None).await;
+        }
+    }
+
+    ulog_info!("[im] AI config hot-updated for bot {}", botId);
+    Ok(())
+}
+
+/// Hot-update permission mode for a running bot.
+/// Permission mode is read from memory on each message — update takes effect immediately.
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn cmd_update_im_bot_permission_mode(
+    imState: tauri::State<'_, ManagedImBots>,
+    botId: String,
+    permissionMode: String,
+) -> Result<(), String> {
+    let perm = {
+        let bots = imState.lock().await;
+        let inst = bots.get(&botId).ok_or("Bot not found or not running")?;
+        Arc::clone(&inst.permission_mode)
+    };
+    *perm.write().await = permissionMode;
+    ulog_info!("[im] Permission mode hot-updated for bot {}", botId);
+    Ok(())
+}
+
+/// Hot-update MCP servers for a running bot.
+/// Syncs to all active Sidecars via POST /api/mcp/set — Sidecar internally handles
+/// abort+resume (or deferred restart if a turn is in progress).
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn cmd_update_im_bot_mcp_servers(
+    imState: tauri::State<'_, ManagedImBots>,
+    botId: String,
+    mcpServersJson: Option<String>,
+) -> Result<(), String> {
+    let (router, mcp_servers) = {
+        let bots = imState.lock().await;
+        let inst = bots.get(&botId).ok_or("Bot not found or not running")?;
+        (Arc::clone(&inst.router), Arc::clone(&inst.mcp_servers_json))
+    };
+
+    *mcp_servers.write().await = mcpServersJson.clone();
+
+    // Sync to all active Sidecars — setMcpServers() handles abort+resume internally
+    let router = router.lock().await;
+    for port in router.active_sidecar_ports() {
+        router.sync_ai_config(port, None, mcpServersJson.as_deref()).await;
+    }
+
+    ulog_info!("[im] MCP servers hot-updated for bot {}", botId);
+    Ok(())
+}
+
+/// Hot-update allowed users whitelist for a running bot.
+/// The adapter shares the same Arc — change takes effect immediately on next message auth check.
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn cmd_update_im_bot_allowed_users(
+    imState: tauri::State<'_, ManagedImBots>,
+    botId: String,
+    allowedUsers: Vec<String>,
+) -> Result<(), String> {
+    let users = {
+        let bots = imState.lock().await;
+        let inst = bots.get(&botId).ok_or("Bot not found or not running")?;
+        Arc::clone(&inst.allowed_users)
+    };
+    *users.write().await = allowedUsers;
+    ulog_info!("[im] Allowed users hot-updated for bot {}", botId);
+    Ok(())
+}
+
+/// Hot-update default workspace for a running bot.
+/// Only affects new sessions — existing sessions keep their current workspace.
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn cmd_update_im_bot_workspace(
+    imState: tauri::State<'_, ManagedImBots>,
+    botId: String,
+    workspacePath: String,
+) -> Result<(), String> {
+    let router = {
+        let bots = imState.lock().await;
+        let inst = bots.get(&botId).ok_or("Bot not found or not running")?;
+        Arc::clone(&inst.router)
+    };
+    router.lock().await.set_default_workspace(PathBuf::from(&workspacePath));
+    ulog_info!("[im] Workspace hot-updated for bot {}: {}", botId, workspacePath);
+    Ok(())
 }

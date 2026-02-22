@@ -713,6 +713,7 @@ export interface CronExecuteResponse {
 export interface ProviderEnv {
     base_url?: string;
     api_key?: string;
+    api_protocol?: 'anthropic' | 'openai';
 }
 
 /**
@@ -931,6 +932,19 @@ export async function upgradeSessionId(
         return upgraded;
     } catch (error) {
         console.error(`[tauriClient] Failed to upgrade session ID from ${oldSessionId} to ${newSessionId}:`, error);
+        return false;
+    }
+}
+
+/**
+ * Check if a session's Sidecar has persistent background owners (CronTask or ImBot)
+ * that will keep it alive after a Tab releases its ownership.
+ */
+export async function sessionHasPersistentOwners(sessionId: string): Promise<boolean> {
+    if (!isTauri()) return false;
+    try {
+        return await invoke<boolean>('cmd_session_has_persistent_owners', { sessionId });
+    } catch {
         return false;
     }
 }

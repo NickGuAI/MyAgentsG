@@ -6,7 +6,7 @@ import {
     loadAppConfig,
     loadProjects,
     removeProject as removeProjectService,
-    saveAppConfig,
+    atomicModifyConfig,
     updateProject as updateProjectService,
     patchProject as patchProjectService,
     touchProject as touchProjectService,
@@ -19,6 +19,7 @@ import {
     saveCustomProvider as saveCustomProviderService,
     deleteCustomProvider as deleteCustomProviderService,
     ensureBundledWorkspace,
+    updateImBotConfig,
 } from '@/config/configService';
 import { CUSTOM_EVENTS } from '../../shared/constants';
 import {
@@ -131,6 +132,33 @@ export function useConfig(): UseConfigResult {
                 loadProviderVerifyStatusService(),
             ]);
 
+            // Migration: ensure enabled IM bots have availableProvidersJson persisted
+            // This runs BEFORE Rust schedule_auto_start (3s delay), so auto-started bots get the data
+            const imBots = loadedConfig.imBotConfigs ?? [];
+            const botsNeedingSync = imBots.filter(b => b.enabled && !b.availableProvidersJson);
+            if (botsNeedingSync.length > 0) {
+                const mergedProviders = mergePresetCustomModels(loadedProviders, loadedConfig.presetCustomModels);
+                const availableProviders = mergedProviders
+                    .filter(p => p.type === 'subscription' || (p.type === 'api' && loadedApiKeys[p.id]))
+                    .map(p => ({
+                        id: p.id, name: p.name, primaryModel: p.primaryModel,
+                        baseUrl: p.config.baseUrl, authType: p.authType,
+                        apiKey: p.type !== 'subscription' ? loadedApiKeys[p.id] : undefined,
+                        models: p.models.map(m => ({ model: m.model, modelName: m.modelName })),
+                    }));
+                if (availableProviders.length > 0) {
+                    const json = JSON.stringify(availableProviders);
+                    // Write to disk before Rust auto-start (3s delay) picks up config.json
+                    for (const bot of botsNeedingSync) {
+                        try {
+                            await updateImBotConfig(bot.id, { availableProvidersJson: json });
+                        } catch (e) {
+                            console.warn(`[useConfig] Failed to sync availableProvidersJson for bot ${bot.id}:`, e);
+                        }
+                    }
+                }
+            }
+
             setConfig(loadedConfig);
             setProjects(loadedProjects);
             setRawProviders(loadedProviders);
@@ -149,11 +177,10 @@ export function useConfig(): UseConfigResult {
     }, [load]);
 
     const updateConfig = useCallback(async (updates: Partial<AppConfig>) => {
-        // Load latest config from disk to avoid overwriting concurrent changes (e.g., API keys)
-        const latestConfig = await loadAppConfig();
-        const newConfig = { ...latestConfig, ...updates };
+        // Atomic read-modify-write: read + merge + write all happen inside the config lock,
+        // preventing races with other atomic config operations (e.g., updateImBotConfig).
+        const newConfig = await atomicModifyConfig(config => ({ ...config, ...updates }));
         setConfig(newConfig);
-        await saveAppConfig(newConfig);
         // Notify other components (e.g., App.tsx) that config has changed
         if (typeof window !== 'undefined') {
             window.dispatchEvent(new Event(CUSTOM_EVENTS.CONFIG_CHANGED));
@@ -304,29 +331,32 @@ export function useConfig(): UseConfigResult {
 
     // Save custom models for a preset provider
     const savePresetCustomModels = useCallback(async (providerId: string, models: ModelEntity[]) => {
-        // Load latest config from disk to avoid overwriting concurrent changes (e.g., API keys)
-        const latestConfig = await loadAppConfig();
-        const newPresetCustomModels = {
-            ...latestConfig.presetCustomModels,
-            [providerId]: models,
-        };
-        // Remove entry if empty
-        if (models.length === 0) {
-            delete newPresetCustomModels[providerId];
-        }
-        const newConfig = { ...latestConfig, presetCustomModels: newPresetCustomModels };
+        const newConfig = await atomicModifyConfig(config => {
+            const newPresetCustomModels = {
+                ...config.presetCustomModels,
+                [providerId]: models,
+            };
+            if (models.length === 0) {
+                delete newPresetCustomModels[providerId];
+            }
+            return { ...config, presetCustomModels: newPresetCustomModels };
+        });
         setConfig(newConfig);
-        await saveAppConfig(newConfig);
     }, []);
 
     // Remove a single custom model from a preset provider
     const removePresetCustomModel = useCallback(async (providerId: string, modelId: string) => {
-        // Load latest config from disk to get current presetCustomModels
-        const latestConfig = await loadAppConfig();
-        const currentModels = latestConfig.presetCustomModels?.[providerId] ?? [];
-        const newModels = currentModels.filter(m => m.model !== modelId);
-        await savePresetCustomModels(providerId, newModels);
-    }, [savePresetCustomModels]);
+        const newConfig = await atomicModifyConfig(config => {
+            const currentModels = config.presetCustomModels?.[providerId] ?? [];
+            const newModels = currentModels.filter(m => m.model !== modelId);
+            const newPresetCustomModels = { ...config.presetCustomModels, [providerId]: newModels };
+            if (newModels.length === 0) {
+                delete newPresetCustomModels[providerId];
+            }
+            return { ...config, presetCustomModels: newPresetCustomModels };
+        });
+        setConfig(newConfig);
+    }, []);
 
     return {
         config,

@@ -6,6 +6,7 @@ import { query, type Query, type SDKUserMessage, type AgentDefinition } from '@a
 import { getScriptDir, getBundledBunDir } from './utils/runtime';
 import { getCrossPlatformEnv } from './utils/platform';
 import { cronToolsServer, getCronTaskContext, clearCronTaskContext } from './tools/cron-tools';
+import { imCronToolServer, getImCronContext } from './tools/im-cron-tool';
 
 import type { ToolInput } from '../renderer/types/chat';
 import { parsePartialJson } from '../shared/parsePartialJson';
@@ -114,7 +115,7 @@ export type MessageWire = {
     isImage?: boolean;
   }[];
   metadata?: {
-    source: 'desktop' | 'telegram_private' | 'telegram_group';
+    source: 'desktop' | 'telegram_private' | 'telegram_group' | 'feishu_private' | 'feishu_group';
     sourceId?: string;
     senderName?: string;
   };
@@ -140,8 +141,10 @@ const streamIndexToToolId: Map<number, string> = new Map();
 const toolResultIndexToId: Map<number, string> = new Map();
 
 // IM Draft Stream: callback for streaming text to Telegram
-type ImStreamCallback = (event: 'delta' | 'block-end' | 'complete' | 'error' | 'permission-request', data: string) => void;
+type ImStreamCallback = (event: 'delta' | 'block-end' | 'complete' | 'error' | 'permission-request' | 'activity', data: string) => void;
 let imStreamCallback: ImStreamCallback | null = null;
+// Flag: auto-reset session after image content pollutes conversation history
+let shouldResetSessionAfterError = false;
 // Track text block indices for detecting text-type content_block_stop
 const imTextBlockIndices = new Set<number>();
 const childToolToParent: Map<string, string> = new Map();
@@ -174,8 +177,33 @@ export type ProviderEnv = {
   baseUrl?: string;
   apiKey?: string;
   authType?: 'auth_token' | 'api_key' | 'both' | 'auth_token_clear_api_key';
+  apiProtocol?: 'anthropic' | 'openai';
 };
 let currentProviderEnv: ProviderEnv | undefined = undefined;
+
+// OpenAI Bridge: sidecar port for loopback, and active bridge config
+let sidecarPort: number = 0;
+
+export type OpenAiBridgeConfig = {
+  baseUrl: string;
+  apiKey: string;
+  /** Target model name — bridge overrides ALL request models to this */
+  model?: string;
+} | null;
+
+let currentOpenAiBridgeConfig: OpenAiBridgeConfig = null;
+
+/** Set the sidecar port (called once from index.ts on startup) */
+export function setSidecarPort(port: number): void {
+  sidecarPort = port;
+}
+
+/** Get the current OpenAI bridge config (used by bridge handler in index.ts).
+ *  Model is always derived from currentModel to avoid staleness after setSessionModel(). */
+export function getOpenAiBridgeConfig(): OpenAiBridgeConfig {
+  if (!currentOpenAiBridgeConfig) return null;
+  return { ...currentOpenAiBridgeConfig, model: currentModel || undefined };
+}
 // SDK 是否已注册当前 sessionId。true 时后续 query 必须用 resume。
 // 仅由非 pre-warm 的 system_init 设为 true，仅由 sessionId 变更设为 false。
 // Pre-warm 永不修改此标志 — 从结构上消除超时/重试导致的状态错误。
@@ -230,7 +258,7 @@ function abortPersistentSession(): void {
   shouldAbortSession = true;
   // Notify IM stream callback before abort
   if (imStreamCallback) {
-    imStreamCallback('error', 'Session aborted');
+    imStreamCallback('error', '会话已中断，请重新发送');
     imStreamCallback = null;
   }
   // 唤醒被阻塞的 generator（waitForMessage）
@@ -384,9 +412,8 @@ const PRESET_MCP_SERVERS: McpServerDefinition[] = [
     description: '浏览器自动化能力，支持网页浏览、截图、表单填写等',
     type: 'stdio',
     command: 'npx',
-    // Use --isolated to avoid conflicts with existing Chrome browser sessions
-    // Each session will use a fresh profile in memory
-    args: ['@playwright/mcp@latest', '--isolated'],
+    // --user-data-dir is configured by user via config.mcpServerArgs for browser state persistence
+    args: ['@playwright/mcp@latest'],
     env: {},
     isBuiltin: true,
   },
@@ -425,11 +452,13 @@ function loadMcpServersFromConfig(): McpServerDefinition[] {
     // Filter to only globally enabled servers
     const enabledServers = allServers.filter(s => globalEnabledIds.includes(s.id));
 
-    // Also apply server-specific env overrides if any
+    // Apply server-specific args and env overrides
+    const serverArgsConfig: Record<string, string[]> = config.mcpServerArgs ?? {};
     const serverEnvConfig: Record<string, Record<string, string>> = config.mcpServerEnv ?? {};
 
     return enabledServers.map(server => ({
       ...server,
+      args: [...(server.args ?? []), ...(serverArgsConfig[server.id] ?? [])],
       env: { ...server.env, ...(serverEnvConfig[server.id] ?? {}) }
     }));
   } catch (error) {
@@ -533,6 +562,10 @@ export function setAgents(agents: Record<string, AgentDefinition>): void {
  * so this does NOT trigger schedulePreWarm(). The debounced pre-warm
  * from MCP/agents sync will pick up the model automatically.
  */
+export function getSessionModel(): string | undefined {
+  return currentModel;
+}
+
 export function setSessionModel(model: string): void {
   if (model === currentModel) return;
 
@@ -613,6 +646,15 @@ function checkMcpToolPermission(toolName: string): { allowed: true } | { allowed
     }
     // Not in cron context - this tool shouldn't be available
     return { allowed: false, reason: '定时任务工具只能在定时任务执行期间使用' };
+  }
+
+  // Special case: im-cron is a built-in MCP server for IM Bot scheduled tasks
+  if (serverId === 'im-cron') {
+    const imCtx = getImCronContext();
+    if (imCtx) {
+      return { allowed: true };
+    }
+    return { allowed: false, reason: 'IM 定时任务工具只能在 IM Bot 会话中使用' };
   }
 
   // Case 1: MCP not set (null) - allow all (backward compatible)
@@ -718,6 +760,13 @@ function buildSdkMcpServers(): Record<string, SdkMcpServerConfig | typeof cronTo
   if (cronContext.taskId) {
     result['cron-tools'] = cronToolsServer;
     console.log(`[agent] Added cron-tools MCP server for task ${cronContext.taskId}`);
+  }
+
+  // Add IM cron tool if we're in an IM context with management API available
+  const imCronCtx = getImCronContext();
+  if (imCronCtx && process.env.MYAGENTS_MANAGEMENT_PORT) {
+    result['im-cron'] = imCronToolServer;
+    console.log(`[agent] Added im-cron MCP server for bot ${imCronCtx.botId}`);
   }
 
   // Return early if no user MCP servers (but may have cron-tools)
@@ -1184,10 +1233,14 @@ function persistMessagesToStorage(
 ): void {
   const sessionMessages: SessionMessage[] = messages.map((msg, index) => {
     const isLastAssistant = index === messages.length - 1 && msg.role === 'assistant';
+    // Strip Playwright tool results from disk persistence (keep in-memory data for SDK context)
+    const contentForDisk = typeof msg.content === 'string'
+      ? msg.content
+      : JSON.stringify(stripPlaywrightResults(msg.content));
     return {
       id: msg.id,
       role: msg.role,
-      content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+      content: contentForDisk,
       timestamp: msg.timestamp,
       sdkUuid: msg.sdkUuid,
       attachments: msg.attachments?.map((att) => ({
@@ -1212,7 +1265,60 @@ export function getSessionId(): string {
   return sessionId;
 }
 
+/** Localize SDK/system error messages for IM end-users */
+function localizeImError(rawError: string): string {
+  if (!rawError) return '模型处理消息时出错';
+
+  // Image content not supported by model
+  if (rawError.includes('unknown variant') && rawError.includes('image')) {
+    return '当前模型不支持图片，请发送文字消息';
+  }
+  // Model validation error (SDK rejects unknown model for the configured provider)
+  if (rawError.includes('issue with the selected model')) {
+    return '所选模型不可用，请检查 IM Bot 的模型和供应商配置';
+  }
+  // SDK subprocess crashed (Windows: anti-virus, OOM, etc.)
+  if (rawError.includes('process exited with code') || rawError.includes('process terminated')) {
+    return 'AI 引擎异常退出，正在自动恢复，请稍后重试';
+  }
+  // API authentication errors
+  if (rawError.includes('authentication') || rawError.includes('unauthorized') || rawError.includes('401')) {
+    return 'API 认证失败，请检查 API Key 配置';
+  }
+  // Rate limiting
+  if (rawError.includes('rate_limit') || rawError.includes('429')) {
+    return 'API 请求频率超限，请稍后重试';
+  }
+  // Billing errors
+  if (rawError.includes('billing') || rawError.includes('insufficient_quota') || rawError.includes('quota_exceeded')) {
+    return 'API 余额不足，请充值后重试';
+  }
+  // Server overloaded
+  if (rawError.includes('overloaded') || rawError.includes('503')) {
+    return 'AI 服务繁忙，请稍后重试';
+  }
+  // Callback replaced
+  if (rawError.includes('Replaced by a newer') || rawError.includes('消息处理被新请求取代')) {
+    return '消息处理被新请求取代，请重新发送';
+  }
+  // Default: truncate long API errors for readability
+  if (rawError.length > 100) {
+    return rawError.substring(0, 100) + '...';
+  }
+  return rawError;
+}
+
 export function setImStreamCallback(cb: ImStreamCallback | null): void {
+  // Defense-in-depth: if there's already an active callback when setting a new one,
+  // notify the old callback with an error so its SSE stream terminates cleanly.
+  // This should not happen when peer_locks are properly used, but guards against
+  // silent callback replacement that would leave the old SSE stream hanging.
+  if (cb !== null && imStreamCallback !== null) {
+    console.warn('[agent] setImStreamCallback: replacing active callback — notifying old stream');
+    try {
+      imStreamCallback('error', '消息处理被新请求取代');
+    } catch { /* old stream may already be closed */ }
+  }
   imStreamCallback = cb;
 }
 
@@ -1328,6 +1434,38 @@ export function buildClaudeSessionEnv(providerEnv?: ProviderEnv): NodeJS.Process
 
   // Use provided providerEnv or fall back to currentProviderEnv
   const effectiveProviderEnv = providerEnv ?? currentProviderEnv;
+
+  // OpenAI Bridge: if provider uses OpenAI protocol, loopback to sidecar
+  if (effectiveProviderEnv?.apiProtocol === 'openai' && sidecarPort > 0) {
+    // SDK requests go to sidecar's /v1/messages route, which translates to OpenAI format
+    env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${sidecarPort}`;
+    env.ANTHROPIC_API_KEY = effectiveProviderEnv.apiKey ?? '';
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    // CRITICAL: Strip proxy env vars from subprocess environment.
+    // The Claude Code CLI's MA6() unconditionally sets fetchOptions.proxy for the Anthropic
+    // SDK client when any proxy env var is present, WITHOUT checking no_proxy. This causes
+    // the loopback request to http://127.0.0.1:{port} to be routed through the system proxy,
+    // resulting in timeout/502 errors. The subprocess only needs to talk to our local bridge;
+    // the bridge handler itself handles upstream proxy if needed (via process.env).
+    for (const proxyVar of [
+      'http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY',
+      'ALL_PROXY', 'all_proxy', 'no_proxy', 'NO_PROXY',
+    ]) {
+      delete env[proxyVar];
+    }
+    // Store upstream config for bridge handler (includes proxy from process.env for upstream fetch)
+    // Note: model is NOT stored here — getOpenAiBridgeConfig() derives it from currentModel
+    // to stay in sync after setSessionModel() / applySessionConfig() model switches
+    currentOpenAiBridgeConfig = {
+      baseUrl: effectiveProviderEnv.baseUrl ?? '',
+      apiKey: effectiveProviderEnv.apiKey ?? '',
+    };
+    console.log(`[env] OpenAI bridge: ANTHROPIC_BASE_URL → loopback :${sidecarPort}, upstream → ${effectiveProviderEnv.baseUrl}, proxy vars stripped`);
+    return env;
+  }
+
+  // Clear bridge config when not using OpenAI protocol
+  currentOpenAiBridgeConfig = null;
 
   // Handle provider-specific environment variables
   // IMPORTANT: Must explicitly delete these when switching back to Anthropic subscription
@@ -1857,9 +1995,9 @@ function handleMessageStopped(): void {
 
 function handleMessageError(error: string): void {
   isStreamingMessage = false;
-  // Notify IM stream: error
+  // Notify IM stream: localized error
   if (imStreamCallback) {
-    imStreamCallback('error', error);
+    imStreamCallback('error', localizeImError(error));
     imStreamCallback = null;
   }
   setSessionState('idle');
@@ -1905,6 +2043,36 @@ function findToolBlockById(toolUseId: string): { tool: ToolUseState } | null {
     }
   }
   return null;
+}
+
+/** Sentinel value for stripped Playwright tool results (truthy, so ProcessRow sees tool as complete) */
+const PLAYWRIGHT_RESULT_SENTINEL = '[playwright_result_stripped]';
+
+/** Set of tool_use IDs whose results are stripped from frontend broadcast in the current turn */
+const strippedToolResultIds = new Set<string>();
+
+function isPlaywrightTool(toolUseId: string): boolean {
+  const toolBlock = findToolBlockById(toolUseId);
+  return toolBlock?.tool.name.startsWith('mcp__playwright__') ?? false;
+}
+
+/**
+ * Strip Playwright tool results from ContentBlock[] for frontend/persistence.
+ * Replaces tool.result with a sentinel so ProcessRow still sees the tool as complete.
+ * Keeps in-memory SDK data intact for conversation context.
+ */
+export function stripPlaywrightResults(content: ContentBlock[]): ContentBlock[] {
+  return content.map(block => {
+    if (
+      block.type === 'tool_use' &&
+      block.tool?.name.startsWith('mcp__playwright__') &&
+      block.tool.result &&
+      block.tool.result !== PLAYWRIGHT_RESULT_SENTINEL
+    ) {
+      return { ...block, tool: { ...block.tool, result: PLAYWRIGHT_RESULT_SENTINEL } };
+    }
+    return block;
+  });
 }
 
 function appendToolResultDelta(toolUseId: string, delta: string): void {
@@ -2154,6 +2322,7 @@ function clearMessageState(): void {
   toolResultIndexToId.clear();
   childToolToParent.clear();
   imTextBlockIndices.clear();
+  strippedToolResultIds.clear();
   isStreamingMessage = false;
   messageSequence = 0;
   pendingConfigRestart = false;
@@ -2509,7 +2678,7 @@ export async function enqueueUserMessage(
   permissionMode?: PermissionMode,
   model?: string,
   providerEnv?: ProviderEnv,
-  metadata?: { source: 'desktop' | 'telegram_private' | 'telegram_group'; sourceId?: string; senderName?: string },
+  metadata?: { source: 'desktop' | 'telegram_private' | 'telegram_group' | 'feishu_private' | 'feishu_group'; sourceId?: string; senderName?: string },
 ): Promise<EnqueueResult> {
   // 等待进行中的时间回溯完成，防止并发写入 messages/session 状态
   if (rewindPromise) {
@@ -3084,11 +3253,10 @@ async function startStreamingSession(preWarm = false): Promise<void> {
           };
         }
 
-        // Special case: cron-tools is a built-in trusted server
+        // Special case: built-in trusted MCP servers (cron-tools, im-cron)
         // When allowed by checkMcpToolPermission, skip user confirmation entirely
-        // (AI should be able to exit cron task without user approval)
-        if (toolName.startsWith('mcp__cron-tools__')) {
-          console.log(`[permission] cron-tools auto-allowed: ${toolName}`);
+        if (toolName.startsWith('mcp__cron-tools__') || toolName.startsWith('mcp__im-cron__')) {
+          console.log(`[permission] built-in tool auto-allowed: ${toolName}`);
           return {
             behavior: 'allow' as const,
             updatedInput: input as Record<string, unknown>
@@ -3267,10 +3435,13 @@ async function startStreamingSession(preWarm = false): Promise<void> {
                   delta: streamEvent.delta.text
                 });
               } else {
-                broadcast('chat:tool-result-delta', {
-                  toolUseId: sdkMessage.parent_tool_use_id,
-                  delta: streamEvent.delta.text
-                });
+                // Skip broadcasting delta for stripped Playwright tools (keep in-memory data intact)
+                if (!strippedToolResultIds.has(sdkMessage.parent_tool_use_id)) {
+                  broadcast('chat:tool-result-delta', {
+                    toolUseId: sdkMessage.parent_tool_use_id,
+                    delta: streamEvent.delta.text
+                  });
+                }
               }
               appendToolResultDelta(sdkMessage.parent_tool_use_id, streamEvent.delta.text);
             } else {
@@ -3320,8 +3491,13 @@ async function startStreamingSession(preWarm = false): Promise<void> {
           }
         } else if (streamEvent.type === 'content_block_start') {
           // IM stream: track text block indices (non-subagent only)
-          if (imStreamCallback && streamEvent.content_block.type === 'text' && !sdkMessage.parent_tool_use_id) {
-            imTextBlockIndices.add(streamEvent.index);
+          if (imStreamCallback && !sdkMessage.parent_tool_use_id) {
+            if (streamEvent.content_block.type === 'text') {
+              imTextBlockIndices.add(streamEvent.index);
+            } else {
+              // Notify non-text block activity (thinking, tool_use) so IM can show placeholder
+              imStreamCallback('activity', streamEvent.content_block.type);
+            }
           }
           if (streamEvent.content_block.type === 'thinking') {
             broadcast('chat:thinking-start', { index: streamEvent.index });
@@ -3415,9 +3591,14 @@ async function startStreamingSession(preWarm = false): Promise<void> {
                   isError: toolResultBlock.is_error || false
                 });
               } else {
+                // Strip Playwright tool results from frontend broadcast
+                const shouldStripResult = isPlaywrightTool(toolResultBlock.tool_use_id);
+                if (shouldStripResult) {
+                  strippedToolResultIds.add(toolResultBlock.tool_use_id);
+                }
                 broadcast('chat:tool-result-start', {
                   toolUseId: toolResultBlock.tool_use_id,
-                  content: contentStr,
+                  content: shouldStripResult ? PLAYWRIGHT_RESULT_SENTINEL : contentStr,
                   isError: toolResultBlock.is_error || false
                 });
               }
@@ -3534,9 +3715,10 @@ async function startStreamingSession(preWarm = false): Promise<void> {
                 });
               } else {
                 // Top-level tool result (e.g., WebSearch without parent)
+                const stripped = strippedToolResultIds.has(toolResultBlock.tool_use_id) || isPlaywrightTool(toolResultBlock.tool_use_id);
                 broadcast('chat:tool-result-complete', {
                   toolUseId: toolResultBlock.tool_use_id,
-                  content: contentStr
+                  content: stripped ? PLAYWRIGHT_RESULT_SENTINEL : contentStr
                 });
               }
               handleToolResultComplete(toolResultBlock.tool_use_id, contentStr);
@@ -3601,9 +3783,10 @@ async function startStreamingSession(preWarm = false): Promise<void> {
           const text = formatAssistantContent(assistantMessage.content);
           if (text) {
             const next = appendToolResultContent(sdkMessage.parent_tool_use_id, text);
+            const stripped = strippedToolResultIds.has(sdkMessage.parent_tool_use_id) || isPlaywrightTool(sdkMessage.parent_tool_use_id);
             broadcast('chat:tool-result-complete', {
               toolUseId: sdkMessage.parent_tool_use_id,
-              content: next
+              content: stripped ? PLAYWRIGHT_RESULT_SENTINEL : next
             });
           }
         }
@@ -3661,9 +3844,10 @@ async function startStreamingSession(preWarm = false): Promise<void> {
                   isError: toolResultBlock.is_error || false
                 });
               } else {
+                const stripped = strippedToolResultIds.has(toolResultBlock.tool_use_id) || isPlaywrightTool(toolResultBlock.tool_use_id);
                 broadcast('chat:tool-result-complete', {
                   toolUseId: toolResultBlock.tool_use_id,
-                  content: contentStr,
+                  content: stripped ? PLAYWRIGHT_RESULT_SENTINEL : contentStr,
                   isError: toolResultBlock.is_error || false
                 });
               }
@@ -3681,6 +3865,9 @@ async function startStreamingSession(preWarm = false): Promise<void> {
         // This is the authoritative source for token statistics
         const resultMessage = sdkMessage as {
           type: 'result';
+          is_error?: boolean;
+          result?: string;
+          errors?: string[];
           usage?: {
             input_tokens?: number;
             output_tokens?: number;
@@ -3694,6 +3881,22 @@ async function startStreamingSession(preWarm = false): Promise<void> {
             cacheCreationInputTokens?: number;
           }>;
         };
+
+        // Forward SDK error results to IM callback (prevents "(No Response)")
+        if (resultMessage.is_error) {
+          const rawError = resultMessage.result || resultMessage.errors?.join('; ') || '';
+          // Detect image content error — reset session to clear polluted history
+          // (applies to both IM and desktop: prevents all subsequent messages from failing)
+          if (rawError.includes('unknown variant') && rawError.includes('image')) {
+            shouldResetSessionAfterError = true;
+          }
+          if (imStreamCallback) {
+            const errorText = localizeImError(rawError);
+            console.warn('[agent] SDK result is_error, forwarding to IM:', errorText);
+            imStreamCallback('error', errorText);
+            imStreamCallback = null;
+          }
+        }
 
         // Prefer modelUsage (per-model breakdown), fallback to aggregate usage
         if (resultMessage.modelUsage) {
@@ -3770,6 +3973,13 @@ async function startStreamingSession(preWarm = false): Promise<void> {
         });
         handleMessageComplete();
         signalTurnComplete();  // 解锁 generator 进入下一轮
+
+        // Auto-reset session if image content polluted conversation history
+        if (shouldResetSessionAfterError) {
+          shouldResetSessionAfterError = false;
+          console.warn('[agent] Auto-resetting session due to image content error in history');
+          resetSession().catch(e => console.error('[agent] Auto-reset failed:', e));
+        }
 
         // Deferred config restart: MCP/Agents changed during this turn but we didn't
         // abort mid-response. Now that the turn completed naturally, restart the session

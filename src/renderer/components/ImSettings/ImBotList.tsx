@@ -21,7 +21,7 @@ export default function ImBotList({
     const toast = useToast();
     const toastRef = useRef(toast);
     toastRef.current = toast;
-    const { providers, apiKeys, refreshConfig } = useConfig();
+    const { providers, apiKeys } = useConfig();
     const isMountedRef = useRef(true);
 
     // Bot statuses: botId → status
@@ -37,6 +37,9 @@ export default function ImBotList({
     }, []);
 
     // Poll all bot statuses
+    const configsRef = useRef(configs);
+    configsRef.current = configs;
+
     useEffect(() => {
         if (!isTauriEnvironment()) return;
 
@@ -45,18 +48,33 @@ export default function ImBotList({
                 const { invoke } = await import('@tauri-apps/api/core');
                 const result = await invoke<Record<string, ImBotStatus>>('cmd_im_all_bots_status');
                 if (isMountedRef.current) {
-                    // Skip overwriting statuses for bots currently being toggled
+                    // Build a complete status map: bots in the poll result keep their
+                    // status; bots NOT in the result are explicitly marked as stopped.
+                    // This prevents the cfg.enabled fallback from kicking in after a
+                    // stop (the fallback can be stale due to useConfig state isolation).
+                    const stoppedDefault: ImBotStatus = {
+                        status: 'stopped',
+                        uptimeSeconds: 0,
+                        activeSessions: [],
+                        restartCount: 0,
+                        bufferedMessages: 0,
+                    };
+                    const complete: Record<string, ImBotStatus> = {};
+                    for (const cfg of configsRef.current) {
+                        complete[cfg.id] = result[cfg.id] ?? stoppedDefault;
+                    }
+
                     const toggling = togglingIdsRef.current;
                     if (toggling.size > 0) {
                         setStatuses(prev => {
-                            const merged = { ...result };
+                            const merged = { ...complete };
                             for (const id of toggling) {
                                 if (prev[id]) merged[id] = prev[id];
                             }
                             return merged;
                         });
                     } else {
-                        setStatuses(result);
+                        setStatuses(complete);
                     }
                 }
             } catch {
@@ -78,6 +96,7 @@ export default function ImBotList({
                 baseUrl: selectedProvider.config.baseUrl,
                 apiKey: apiKeys[selectedProvider.id],
                 authType: selectedProvider.authType,
+                apiProtocol: selectedProvider.apiProtocol,
             });
         }
 
@@ -90,6 +109,7 @@ export default function ImBotList({
                 baseUrl: p.config.baseUrl,
                 authType: p.authType,
                 apiKey: p.type !== 'subscription' ? apiKeys[p.id] : undefined,
+                models: p.models.map(m => ({ model: m.model, modelName: m.modelName })),
             }));
 
         const allServers = await getAllMcpServers();
@@ -112,6 +132,7 @@ export default function ImBotList({
             platform: cfg.platform,
             feishuAppId: cfg.feishuAppId || null,
             feishuAppSecret: cfg.feishuAppSecret || null,
+            heartbeatConfigJson: cfg.heartbeat ? JSON.stringify(cfg.heartbeat) : null,
         };
     }, [providers, apiKeys]);
 
@@ -141,7 +162,11 @@ export default function ImBotList({
                     });
                     toastRef.current.success(`${cfg.name} 已停止`);
                     await updateImBotConfig(botId, { enabled: false });
-                    await refreshConfig();
+                    // NOTE: Don't call refreshConfig() here — ImBotList's useConfig()
+                    // is a separate instance from ImSettings'. The configs prop comes
+                    // from ImSettings, so refreshing our own config is a no-op.
+                    // The poll now fills missing bots as 'stopped', preventing the
+                    // cfg.enabled fallback from reverting the UI.
                 }
             } else {
                 const hasCredentials = cfg.platform === 'feishu'
@@ -156,8 +181,11 @@ export default function ImBotList({
                 if (isMountedRef.current) {
                     setStatuses(prev => ({ ...prev, [botId]: newStatus }));
                     toastRef.current.success(`${cfg.name} 已启动`);
-                    await updateImBotConfig(botId, { enabled: true });
-                    await refreshConfig();
+                    await updateImBotConfig(botId, {
+                        enabled: true,
+                        providerEnvJson: params.providerEnvJson || undefined,
+                        availableProvidersJson: params.availableProvidersJson || undefined,
+                    });
                 }
             }
         } catch (err) {
@@ -173,7 +201,7 @@ export default function ImBotList({
                 });
             }
         }
-    }, [buildStartParams, refreshConfig]);
+    }, [buildStartParams]);
 
     // Platform icon
     const platformIcon = (platform: string) => {

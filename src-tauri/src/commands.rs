@@ -17,6 +17,7 @@ use crate::sidecar::{
     shutdown_for_update,
 };
 use crate::logger;
+use crate::{ulog_info, ulog_warn};
 
 // ============= Legacy Commands (for backward compatibility) =============
 
@@ -364,17 +365,161 @@ pub fn cmd_initialize_bundled_workspace<R: Runtime>(
         .resource_dir()
         .map_err(|e| format!("Failed to get resource dir: {}", e))?;
     let mino_src = resource_dir.join("mino");
-    if !mino_src.exists() {
-        return Err("Bundled mino not found in resources".to_string());
+    if !mino_src.exists() || !mino_src.join("CLAUDE.md").exists() {
+        return Err(format!(
+            "Bundled mino not found or incomplete in resources: {:?}",
+            mino_src
+        ));
     }
 
+    ulog_info!("[workspace] Initializing bundled workspace from {:?}", mino_src);
     copy_dir_recursive(&mino_src, &mino_dest)
         .map_err(|e| format!("Failed to copy mino workspace: {}", e))?;
+
+    // Validate the copy produced a valid workspace
+    if !mino_dest.join("CLAUDE.md").exists() {
+        let _ = fs::remove_dir_all(&mino_dest);
+        return Err("Bundled mino copy produced incomplete workspace".to_string());
+    }
 
     Ok(InitBundledWorkspaceResult {
         path: mino_dest.to_string_lossy().to_string(),
         is_new: true,
     })
+}
+
+/// Command: Create a dedicated workspace for an IM Bot by copying bundled mino template.
+/// Sanitizes the name for path safety and auto-appends numeric suffix on collision.
+/// Falls back to local mino copy if bundled resources are incomplete.
+/// Returns the created workspace path.
+#[tauri::command]
+pub fn cmd_create_bot_workspace<R: Runtime>(
+    app_handle: AppHandle<R>,
+    workspace_name: String,
+) -> Result<InitBundledWorkspaceResult, String> {
+    let home_dir = dirs::home_dir().ok_or("Failed to get home dir")?;
+    let projects_dir = home_dir.join(".myagents").join("projects");
+
+    // Sanitize name: remove @, replace non-alphanumeric (except CJK) with dash, trim
+    let sanitized = sanitize_workspace_name(&workspace_name);
+    if sanitized.is_empty() {
+        return Err("Workspace name is empty after sanitization".to_string());
+    }
+
+    // Find available path (handle collisions with numeric suffix)
+    let dest = find_available_workspace_path(&projects_dir, &sanitized);
+
+    // Primary: copy from bundled resources
+    let resource_dir = app_handle
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("Failed to get resource dir: {}", e))?;
+    let mino_src = resource_dir.join("mino");
+
+    if mino_src.exists() && mino_src.join("CLAUDE.md").exists() {
+        ulog_info!("[workspace] Copying bundled mino from {:?} to {:?}", mino_src, dest);
+        copy_dir_recursive(&mino_src, &dest)
+            .map_err(|e| format!("Failed to copy workspace template: {}", e))?;
+    }
+
+    // Validate: CLAUDE.md must exist in destination (marker file for a valid mino template)
+    if !dest.join("CLAUDE.md").exists() {
+        // Fallback: copy from the local mino created on first launch
+        let local_mino = projects_dir.join("mino");
+        if local_mino.exists() && local_mino.join("CLAUDE.md").exists() {
+            ulog_warn!("[workspace] Bundled mino incomplete, falling back to local {:?}", local_mino);
+            // Clean up the potentially empty dest before fallback copy
+            let _ = fs::remove_dir_all(&dest);
+            copy_dir_recursive(&local_mino, &dest)
+                .map_err(|e| format!("Failed to copy from local mino: {}", e))?;
+        } else {
+            // Clean up the empty dest
+            let _ = fs::remove_dir_all(&dest);
+            return Err("Mino template not found: bundled resources incomplete and no local copy available".to_string());
+        }
+    }
+
+    ulog_info!("[workspace] Bot workspace created: {:?}", dest);
+    Ok(InitBundledWorkspaceResult {
+        path: dest.to_string_lossy().to_string(),
+        is_new: true,
+    })
+}
+
+/// Command: Remove a workspace directory created by `cmd_create_bot_workspace`.
+/// Safety: only allows deleting directories under `~/.myagents/projects/`.
+#[tauri::command]
+pub fn cmd_remove_bot_workspace(workspace_path: String) -> Result<(), String> {
+    let home_dir = dirs::home_dir().ok_or("Failed to get home dir")?;
+    let projects_dir = home_dir.join(".myagents").join("projects");
+
+    let target = PathBuf::from(&workspace_path);
+    // Canonicalize both paths to prevent traversal attacks
+    let canon_projects = projects_dir.canonicalize()
+        .map_err(|e| format!("Failed to resolve projects dir: {}", e))?;
+    let canon_target = target.canonicalize()
+        .map_err(|e| format!("Failed to resolve workspace path: {}", e))?;
+
+    if !canon_target.starts_with(&canon_projects) || canon_target == canon_projects {
+        return Err("Refusing to delete: path is not inside ~/.myagents/projects/".to_string());
+    }
+
+    fs::remove_dir_all(&canon_target)
+        .map_err(|e| format!("Failed to remove workspace directory: {}", e))?;
+
+    Ok(())
+}
+
+/// Sanitize a workspace name for use as a directory name.
+/// Keeps alphanumeric, CJK characters, hyphens, and underscores.
+fn sanitize_workspace_name(name: &str) -> String {
+    let result: String = name
+        .chars()
+        .filter_map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                Some(c)
+            } else if c == ' ' || c == '@' || c == '/' || c == '\\' {
+                Some('-')
+            } else if c > '\u{2E7F}' {
+                // Keep CJK and other non-ASCII characters
+                Some(c)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Trim leading/trailing dashes and collapse consecutive dashes
+    let mut collapsed = String::new();
+    let mut prev_dash = false;
+    for c in result.chars() {
+        if c == '-' {
+            if !prev_dash && !collapsed.is_empty() {
+                collapsed.push(c);
+            }
+            prev_dash = true;
+        } else {
+            collapsed.push(c);
+            prev_dash = false;
+        }
+    }
+    collapsed.trim_end_matches('-').to_string()
+}
+
+/// Find an available workspace path, appending numeric suffix on collision.
+fn find_available_workspace_path(projects_dir: &Path, base_name: &str) -> PathBuf {
+    let first = projects_dir.join(base_name);
+    if !first.exists() {
+        return first;
+    }
+    for i in 2..=100 {
+        let candidate = projects_dir.join(format!("{}-{}", base_name, i));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // Extremely unlikely fallback
+    projects_dir.join(format!("{}-{}", base_name, uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("x")))
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {

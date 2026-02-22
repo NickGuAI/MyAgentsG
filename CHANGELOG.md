@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.24] - 2026-02-23
+
+### Added
+- **OpenAI 兼容协议桥接**：内置 Anthropic → OpenAI Chat Completions API 转译桥，支持 OpenAI 兼容端点（DeepSeek、Qwen 等）通过 loopback 架构接入 Claude Agent SDK。包含完整的请求/响应转译、SSE 流式传输、`reasoning_content` ↔ thinking block 双向映射、代理感知上游请求
+- **统一日志导出**：设置 > 通用 > 运行日志区域新增导出按钮，将近 3 天统一日志打包为 zip 导出到桌面
+
+### Fixed
+- **IM Bot `/provider` & `/model` 命令配置持久化**：命令切换 Provider/Model 后持久化到 config.json 并同步 Sidecar，前端设置页实时刷新
+- **IM Bot Session ID 失同步**：第三方 → Anthropic 供应商切换时 Bun 内部新建 session，Rust 侧通过 `upgrade_peer_session_id()` 同步 PeerSession + SidecarManager
+- **IM Bot auto-start availableProvidersJson 缺失**：前端启动时持久化 `availableProvidersJson` 到磁盘，Rust auto-start 迁移逻辑兼容旧配置
+- **IM Bot `/model` 动态模型列表**：`/model` 命令显示当前供应商可用模型索引列表，支持按序号选择
+
+---
+
+## [0.1.23] - 2026-02-22
+
+### Fixed
+- **IM Bot 第三方模型 auto-start 失败**：`providerEnvJson`（含 baseUrl/apiKey/authType）只在前端手动启动时构建，Rust auto-start 从磁盘读不到 → 第三方供应商（DeepSeek、Moonshot 等）报 "所选模型不可用"。现在前端在启动/切换 Provider 时持久化 `providerEnvJson` 到 config.json
+- **IM Bot auto-start 向前兼容迁移**：Rust 侧新增 `migrate_provider_env()`，对旧配置（无 `providerEnvJson` 字段）从 `providerApiKeys` + 预设供应商 baseUrl 映射自动重建，确保升级后首次 auto-start 即可用
+- **IM Bot `/new` 命令 port 0 崩溃**：App 重启后恢复的 session `sidecar_port` 为 0，`/new` 发起 HTTP 请求到 `127.0.0.1:0` 导致报错。现在检测 port 0 时本地重置 session 元数据
+- **IM Bot SDK 错误透传与本地化**：SDK `is_error` 标志正确透传到 IM 端、图片历史污染自动重置 session、新增 6 类错误中文本地化（认证失败、频率限制、余额不足、模型不可用等）
+- **更新检查 Toast 重复**：后台下载进行中时重复弹出"正在下载更新"提示
+
+---
+
+## [0.1.22] - 2026-02-22
+
+### Added
+- **飞书 Bot 多媒体接收**：支持接收图片、文件、音频、视频附件，图片走 SDK Vision，文件保存到工作区
+- **MCP 内置服务器 args/env 配置**：内置 MCP 服务器支持自定义启动参数和环境变量
+- **download-anything 内置 Skill**：新增文件下载 bundled skill
+- **Mermaid 图表预览/代码切换**：Mermaid 代码块新增预览/源码切换按钮和复制按钮
+- **YAML Frontmatter 代码高亮**：文件预览中 YAML frontmatter 渲染为语法高亮代码块
+- **上传文件功能升级**：Plus 菜单「上传图片」升级为「上传文件」，支持更多文件类型
+
+### Fixed
+- **心跳/IM 消息竞态条件**：心跳 runner 未获取 peer_lock 导致与用户消息并发访问 imStreamCallback，造成响应丢失和双重 "(No response)"。现在心跳与用户消息通过 peer_lock 串行化，Bun 侧增加纵深防御
+- **Monaco 编辑器 CJK 输入法**：修复中日韩输入法组合输入时的闪烁和异常行为（两轮修复）
+- **Mermaid 图表加载卡死**：多图表场景下 Mermaid 渲染卡在 loading 状态
+- **模态框拖拽误关闭**：拖拽选中文本到遮罩层时不再误触发关闭
+- **Bot 工作区复制校验**：从 bundled mino 复制工作区时增加校验和 fallback
+- **飞书向导步骤优化**：「添加应用能力-机器人」提前到 Step 1，减少配置遗漏
+
+### Changed
+- **Launcher 工作区选择器**：从输入框上方浮动 pill 移入输入框工具栏内，布局更紧凑
+- **README 更新**：同步当前功能列表、支持的供应商和架构说明
+
+---
+
+## [0.1.21] - 2026-02-21
+
+### Added
+- **Bot 创建向导新增工作区步骤**：创建 Bot 时可直接配置独立工作区路径
+- **飞书 Post 富文本消息支持**：Bot 接收飞书 Post 类型消息（含代码块、加粗、列表等富文本），解析 text/a/at/img/emotion/code_block 元素为纯文本
+- **IM Bot /help 命令**：飞书和 Telegram Bot 均支持 `/help` 查看所有可用命令
+- **IM Bot /mode 命令**：通过 `/mode plan|auto|full` 切换权限模式（计划/自动/全自主）
+- **工作区文件单击预览**：右侧「项目工作区」面板中单击文件直接触发预览（原需双击），Ctrl+单击多选保持不变
+
+### Fixed
+- **飞书 Bot 幽灵消息**：dedup 缓存持久化到磁盘（TTL 72h），App 重启后不再重复处理飞书重传的旧事件
+- **飞书消息静默丢失**：含代码块/加粗等格式的消息（msg_type: post）不再被忽略
+- **IM 来源标签错误**：飞书消息不再显示 "via Telegram 群聊"，改用 SOURCE_LABELS 映射正确显示平台名
+- **Provider API Key 验证超时**：使用 project-level settingSources 和 bypassPermissions 避免用户级插件加载阻塞
+- **文件预览 FileReader 挂起**：添加 onerror/reject 处理，防止 Blob 损坏时 isPreviewLoading 永久卡死
+- **Tab 关闭确认误弹**：持久 Owner 保持 Sidecar 存活时跳过关闭确认
+- **Telegram 向导输入顺序**：修正向导步骤输入框顺序，跳过按钮改为返回按钮
+- **绑定消息误处理**：已绑定用户的 BIND 消息静默忽略，避免重复处理
+
+### Performance
+- **前端流式消息隔离**：Playwright tool.result 从前端剥离，流式消息状态独立管理，减少不必要的重渲染
+
+### Changed
+- **飞书代码块输出样式**：AI 回复中的代码块使用 `─── ✦ ───` 分隔线 + 斜体缩进，内联代码映射为加粗+斜体
+- **IM Bot 热更新**：权限模式、MCP 服务器、Provider 等配置变更无需重启 Bot
+- **Heartbeat 系统提示词**：心跳检查使用独立 system prompt，修复 Bot 停止/重启可靠性
+
+---
+
 ## [0.1.20] - 2026-02-19
 
 ### Added

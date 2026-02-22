@@ -102,6 +102,8 @@ pub struct ImConfig {
     pub feishu_app_secret: Option<String>,
     // ===== AI config =====
     #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub provider_env_json: Option<String>,
@@ -110,6 +112,9 @@ pub struct ImConfig {
     /// Available providers for /provider command: [{id, name, primaryModel, baseUrl?, authType?, apiKey?}]
     #[serde(default)]
     pub available_providers_json: Option<String>,
+    // ===== Heartbeat (v0.1.21) =====
+    #[serde(default)]
+    pub heartbeat_config: Option<HeartbeatConfig>,
 }
 
 fn default_platform() -> ImPlatform {
@@ -127,10 +132,12 @@ impl Default for ImConfig {
             enabled: false,
             feishu_app_id: None,
             feishu_app_secret: None,
+            provider_id: None,
             model: None,
             provider_env_json: None,
             mcp_servers_json: None,
             available_providers_json: None,
+            heartbeat_config: None,
         }
     }
 }
@@ -304,6 +311,77 @@ impl Default for ImHealthState {
             buffered_messages: 0,
             last_persisted: chrono::Utc::now().to_rfc3339(),
         }
+    }
+}
+
+// ===== Heartbeat types (v0.1.21) =====
+
+/// Heartbeat configuration for periodic autonomous checks.
+/// The actual checklist content lives in HEARTBEAT.md in the workspace root,
+/// not in this config — the config only controls timing and behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeartbeatConfig {
+    /// Enable/disable heartbeat (default: true)
+    #[serde(default = "default_hb_enabled")]
+    pub enabled: bool,
+    /// Interval in minutes between checks (default: 30, min: 5)
+    #[serde(default = "default_hb_interval")]
+    pub interval_minutes: u32,
+    /// Active hours window
+    #[serde(default)]
+    pub active_hours: Option<ActiveHours>,
+    /// Max chars for HEARTBEAT_OK detection (default: 300)
+    #[serde(default)]
+    pub ack_max_chars: Option<u32>,
+}
+
+fn default_hb_enabled() -> bool {
+    true
+}
+
+fn default_hb_interval() -> u32 {
+    30
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_minutes: 30,
+            active_hours: None,
+            ack_max_chars: None,
+        }
+    }
+}
+
+/// Active hours window for heartbeat scheduling
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveHours {
+    /// Start time in HH:MM format (inclusive)
+    pub start: String,
+    /// End time in HH:MM format (exclusive)
+    pub end: String,
+    /// IANA timezone name (e.g. "Asia/Shanghai")
+    pub timezone: String,
+}
+
+/// Reason for heartbeat wake-up
+#[derive(Debug, Clone)]
+pub enum WakeReason {
+    /// Regular interval tick
+    Interval,
+    /// Cron task completed — high priority, skips active hours check
+    CronComplete { task_id: String, summary: String },
+    /// Manual/external trigger — high priority
+    Manual,
+}
+
+impl WakeReason {
+    /// High-priority wakes skip active hours and empty-prompt checks
+    pub fn is_high_priority(&self) -> bool {
+        !matches!(self, WakeReason::Interval)
     }
 }
 

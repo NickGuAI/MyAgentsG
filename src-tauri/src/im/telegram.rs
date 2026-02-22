@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{sleep, Instant};
 
 use super::types::{ImAttachment, ImAttachmentType, ImConfig, ImMessage, ImPlatform, ImSourceType, TelegramError};
+use super::util::{mime_to_ext, sanitize_filename};
 use super::ApprovalCallback;
 use crate::{proxy_config, ulog_info, ulog_warn, ulog_error, ulog_debug};
 
@@ -289,6 +290,11 @@ impl TelegramAdapter {
                 400 if description.contains("thread not found") => {
                     return Err(TelegramError::ThreadNotFound);
                 }
+                400 if description.contains("REACTION_INVALID") || description.contains("REACTION_EMPTY") => {
+                    // Permanent error: emoji not available as reaction in this chat
+                    ulog_debug!("[telegram] Reaction not available on {} (non-retryable): {}", method, description);
+                    return Err(TelegramError::Other(description.to_string()));
+                }
                 403 if description.contains("was kicked") || description.contains("was blocked") => {
                     return Err(TelegramError::BotKicked);
                 }
@@ -332,7 +338,9 @@ impl TelegramAdapter {
                 { "command": "workspace", "description": "切换工作区 /workspace <path>" },
                 { "command": "model", "description": "查看或切换 AI 模型" },
                 { "command": "provider", "description": "查看或切换 AI 供应商" },
-                { "command": "status", "description": "查看当前状态" }
+                { "command": "mode", "description": "查看或切换权限模式" },
+                { "command": "status", "description": "查看当前状态" },
+                { "command": "help", "description": "查看所有命令" }
             ]
         });
         self.api_call("setMyCommands", &commands).await?;
@@ -491,9 +499,9 @@ impl TelegramAdapter {
         let _ = self.set_reaction(chat_id, message_id, "👀").await;
     }
 
-    /// ACK: processing (⏳)
+    /// ACK: processing (⚡)
     pub async fn ack_processing(&self, chat_id: &str, message_id: i64) {
-        let _ = self.set_reaction(chat_id, message_id, "⏳").await;
+        let _ = self.set_reaction(chat_id, message_id, "⚡").await;
     }
 
     /// ACK: clear reaction
@@ -670,7 +678,16 @@ impl TelegramAdapter {
                 break;
             }
 
-            match self.get_updates(offset).await {
+            // Wrap getUpdates in select! so shutdown can interrupt the 30s long-poll
+            let result = tokio::select! {
+                result = self.get_updates(offset) => result,
+                _ = shutdown_rx.changed() => {
+                    ulog_info!("[telegram] Shutdown during long-poll, exiting");
+                    break;
+                }
+            };
+
+            match result {
                 Ok(updates) => {
                     backoff_secs = INITIAL_BACKOFF_SECS; // Reset backoff on success
 
@@ -1136,47 +1153,6 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<String> {
     }
 
     chunks
-}
-
-/// Map MIME type to file extension
-/// Sanitize a filename from Telegram to prevent path traversal attacks.
-/// Strips path separators, `.` and `..` components, and null bytes.
-fn sanitize_filename(name: &str) -> String {
-    // Take only the last path component (strip any directory traversal)
-    let base = name.rsplit(['/', '\\']).next().unwrap_or("file");
-    // Remove null bytes and leading dots (prevent hidden files / `.` / `..`)
-    let cleaned: String = base
-        .chars()
-        .filter(|c| *c != '\0')
-        .collect();
-    let cleaned = cleaned.trim_start_matches('.');
-    if cleaned.is_empty() {
-        "file".to_string()
-    } else {
-        cleaned.to_string()
-    }
-}
-
-fn mime_to_ext(mime: &str) -> &str {
-    match mime {
-        "audio/ogg" => "ogg",
-        "audio/mpeg" => "mp3",
-        "audio/mp4" | "audio/m4a" => "m4a",
-        "video/mp4" => "mp4",
-        "video/quicktime" => "mov",
-        "image/jpeg" => "jpg",
-        "image/png" => "png",
-        "image/webp" => "webp",
-        "application/pdf" => "pdf",
-        _ => {
-            // Handle mime types with parameters (e.g. "audio/ogg; codecs=opus")
-            if mime.starts_with("audio/ogg") {
-                "ogg"
-            } else {
-                "bin"
-            }
-        }
-    }
 }
 
 /// Clean message text: remove @mention and /ask prefix

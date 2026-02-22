@@ -27,6 +27,7 @@ import {
   CRON_TASK_EXIT_TEXT,
   CRON_TASK_EXIT_REASON_PATTERN,
 } from './tools/cron-tools';
+import { setImCronContext } from './tools/im-cron-tool';
 
 // ============= CRASH DIAGNOSTICS =============
 // File-based logging to capture crashes before process dies
@@ -63,12 +64,14 @@ process.on('unhandledRejection', (reason) => {
 
 process.on('SIGTERM', () => {
   crashLog('SIGNAL', 'SIGTERM');
-  console.error('[process] SIGTERM received');
+  console.error('[process] SIGTERM received, shutting down...');
+  process.exit(0);  // Trigger SDK's process.on('exit') handler → SIGTERM CLI subprocess
 });
 
 process.on('SIGINT', () => {
   crashLog('SIGNAL', 'SIGINT');
-  console.error('[process] SIGINT received');
+  console.error('[process] SIGINT received, shutting down...');
+  process.exit(0);
 });
 
 crashLog('STARTUP', 'Server starting...');
@@ -99,6 +102,9 @@ import {
   clearSystemPromptConfig,
   rewindSession,
   getPendingInteractiveRequests,
+  stripPlaywrightResults,
+  setSidecarPort,
+  getOpenAiBridgeConfig,
   type ProviderEnv,
 } from './agent-session';
 import { getHomeDirOrNull } from './utils/platform';
@@ -119,6 +125,7 @@ import { cleanupOldLogs } from './AgentLogger';
 import { cleanupOldUnifiedLogs, appendUnifiedLogBatch } from './UnifiedLogger';
 import { broadcast, createSseClient, getClients } from './sse';
 import { checkAnthropicSubscription, getGitBranch, verifyProviderViaSdk, verifySubscription } from './provider-verify';
+import { createBridgeHandler } from './openai-bridge';
 
 type ImagePayload = {
   name: string;
@@ -161,6 +168,8 @@ type SendMessagePayload = {
   providerEnv?: {
     baseUrl?: string;
     apiKey?: string;
+    authType?: 'auth_token' | 'api_key' | 'both' | 'auth_token_clear_api_key';
+    apiProtocol?: 'anthropic' | 'openai';
   };
 };
 
@@ -177,6 +186,8 @@ type CronExecutePayload = {
   providerEnv?: {
     baseUrl?: string;
     apiKey?: string;
+    authType?: 'auth_token' | 'api_key' | 'both' | 'auth_token_clear_api_key';
+    apiProtocol?: 'anthropic' | 'openai';
   };
   /** Run mode: "single_session" (keep context) or "new_session" (fresh each time) */
   runMode?: 'single_session' | 'new_session';
@@ -528,6 +539,36 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 /**
+ * Strip HEARTBEAT_OK token from AI response and determine if it's silent or has content.
+ * Supports markdown/HTML wrapping around the token.
+ */
+function stripHeartbeatToken(text: string, ackMaxChars: number): { status: string; text?: string; reason?: string } {
+  if (!text || !text.trim()) {
+    return { status: 'silent', reason: 'empty' };
+  }
+
+  // Check if HEARTBEAT_OK appears in the text (case-insensitive)
+  if (!/HEARTBEAT_OK/i.test(text)) {
+    // No token at all — this is real content
+    return { status: 'content', text };
+  }
+
+  // Strip the token (supports markdown bold, code wrapping)
+  const stripped = text
+    .replace(/\*{0,2}HEARTBEAT_OK\*{0,2}/gi, '')
+    .replace(/`HEARTBEAT_OK`/gi, '')
+    .trim();
+
+  // If remaining text is short enough, treat as silent acknowledgment
+  if (stripped.length <= ackMaxChars) {
+    return { status: 'silent', reason: 'heartbeat_ok' };
+  }
+
+  // Remaining text has substance — treat as content (but strip the token)
+  return { status: 'content', text: stripped };
+}
+
+/**
  * Recursively copy a directory (synchronous version)
  * Security: Skips symbolic links to prevent following links to sensitive locations
  * @param src Source directory path
@@ -584,6 +625,14 @@ interface SwitchPayload {
   initialPrompt?: string;
 }
 
+// System event queue for heartbeat relay (cron completion, etc.)
+const systemEventQueue: Array<{ event: string; content: string; timestamp: number }> = [];
+
+/** Drain all pending system events (used by heartbeat endpoint) */
+export function drainSystemEvents(): Array<{ event: string; content: string; timestamp: number }> {
+  return systemEventQueue.splice(0);
+}
+
 async function main() {
   const { agentDir, initialPrompt, port, sessionId: initialSessionId } = parseArgs(process.argv);
   let currentAgentDir = await ensureAgentDir(agentDir);
@@ -599,6 +648,20 @@ async function main() {
   seedBundledSkills();
 
   await initializeAgent(currentAgentDir, initialPrompt, initialSessionId);
+
+  // Store sidecar port for OpenAI bridge loopback
+  setSidecarPort(port);
+
+  // Create OpenAI bridge handler (lazy: only processes requests when bridge config is active)
+  const bridgeHandler = createBridgeHandler({
+    getUpstreamConfig: () => {
+      const config = getOpenAiBridgeConfig();
+      if (!config) throw new Error('Bridge not active');
+      return { baseUrl: config.baseUrl, apiKey: config.apiKey, model: config.model };
+    },
+    maxOutputTokens: 8192,
+    logger: (msg) => console.log(msg),
+  });
 
   Bun.serve({
     port,
@@ -650,7 +713,11 @@ async function main() {
         const state = getAgentState();
         client.send('chat:init', state);
         getMessages().forEach((message) => {
-          client.send('chat:message-replay', { message });
+          // Strip Playwright tool results from replay to avoid sending large base64 data to frontend
+          const stripped = typeof message.content !== 'string'
+            ? { ...message, content: stripPlaywrightResults(message.content) }
+            : message;
+          client.send('chat:message-replay', { message: stripped });
         });
         client.send('chat:logs', { lines: getLogLines() });
         const systemInitInfo = getSystemInitInfo();
@@ -1337,7 +1404,7 @@ async function main() {
               .map(m => ({
                 id: m.id,
                 role: m.role,
-                content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+                content: typeof m.content === 'string' ? m.content : JSON.stringify(stripPlaywrightResults(m.content)),
                 timestamp: m.timestamp,
                 sdkUuid: m.sdkUuid,
                 attachments: m.attachments?.map(a => ({
@@ -2346,6 +2413,61 @@ async function main() {
         }
       }
 
+      // GET /api/logs/export - Export recent unified logs as zip
+      if (pathname === '/api/logs/export' && request.method === 'GET') {
+        try {
+          const { readdirSync, statSync } = await import('fs');
+          const { join: joinPath } = await import('path');
+          const { homedir } = await import('os');
+          const logsDir = joinPath(homedir(), '.myagents', 'logs');
+
+          // Collect last 3 days of unified-*.log files
+          const now = Date.now();
+          const threeDaysMs = 3 * 24 * 60 * 60 * 1000;
+          const files = readdirSync(logsDir)
+            .filter(f => f.startsWith('unified-') && f.endsWith('.log'))
+            .filter(f => {
+              try {
+                return now - statSync(joinPath(logsDir, f)).mtimeMs < threeDaysMs;
+              } catch { return false; }
+            })
+            .sort();
+
+          if (files.length === 0) {
+            return jsonResponse({ success: false, error: '没有找到近3天的运行日志' }, 404);
+          }
+
+          // Output to Desktop
+          const desktopDir = joinPath(homedir(), 'Desktop');
+          const timestamp = new Date().toISOString().slice(0, 10);
+          const zipName = `MyAgents-logs-${timestamp}.zip`;
+          const zipPath = joinPath(desktopDir, zipName);
+
+          // Create zip using platform-appropriate command
+          const isWin = process.platform === 'win32';
+          const filePaths = files.map(f => joinPath(logsDir, f));
+
+          if (isWin) {
+            // PowerShell Compress-Archive
+            const proc = Bun.spawn(['powershell', '-Command',
+              `Compress-Archive -Path '${filePaths.join("','")}' -DestinationPath '${zipPath}' -Force`
+            ]);
+            await proc.exited;
+          } else {
+            // macOS/Linux: zip command
+            const proc = Bun.spawn(['zip', '-j', zipPath, ...filePaths]);
+            await proc.exited;
+          }
+
+          return jsonResponse({ success: true, path: zipPath });
+        } catch (error) {
+          return jsonResponse({
+            success: false,
+            error: error instanceof Error ? error.message : 'Failed to export logs'
+          }, 500);
+        }
+      }
+
       // ============= PROVIDER VERIFICATION API =============
 
       // POST /api/provider/verify - Verify API key via SDK (same path as normal chat)
@@ -2356,9 +2478,10 @@ async function main() {
             apiKey?: string;
             model?: string;
             authType?: string;
+            apiProtocol?: string;
           };
 
-          const { baseUrl, apiKey, model, authType } = payload;
+          const { baseUrl, apiKey, model, authType, apiProtocol } = payload;
 
           if (!baseUrl || !apiKey) {
             return jsonResponse({ success: false, error: 'baseUrl and apiKey are required.' }, 400);
@@ -2369,8 +2492,15 @@ async function main() {
           console.log(`[api/provider/verify] apiKey: ${apiKey.slice(0, 10)}...`);
           console.log(`[api/provider/verify] model: ${model ?? 'default'}`);
           console.log(`[api/provider/verify] authType: ${authType ?? 'both'}`);
+          console.log(`[api/provider/verify] apiProtocol: ${apiProtocol ?? 'anthropic'}`);
 
-          const result = await verifyProviderViaSdk(baseUrl, apiKey, authType ?? 'both', model || undefined);
+          // Unified SDK verification for all protocols (Anthropic + OpenAI)
+          // For OpenAI protocol: SDK → CLI → bridge loopback → upstream (end-to-end)
+          // For Anthropic protocol: SDK → CLI → upstream (same as before)
+          const result = await verifyProviderViaSdk(
+            baseUrl, apiKey, authType ?? 'both', model || undefined,
+            apiProtocol === 'openai' ? 'openai' : undefined,
+          );
 
           console.log(`[api/provider/verify] result:`, JSON.stringify(result));
           console.log(`[api/provider/verify] =========================`);
@@ -4315,6 +4445,27 @@ async function main() {
         }
       }
 
+      // GET /api/session/config - Read sidecar's current config state
+      // Used by Tabs joining an existing sidecar (e.g. IM Bot session) to adopt
+      // the session's config instead of pushing their own.
+      if (pathname === '/api/session/config' && request.method === 'GET') {
+        try {
+          const { getSessionModel, getMcpServers, getAgents } = await import('./agent-session');
+          const model = getSessionModel();
+          const mcpServers = getMcpServers();
+          const agents = getAgents();
+          return jsonResponse({
+            success: true,
+            model: model ?? null,
+            mcpServerIds: mcpServers?.map(s => s.id) ?? null,
+            agentNames: agents ? Object.keys(agents) : null,
+          });
+        } catch (error) {
+          console.error('[api/session/config] Error:', error);
+          return jsonResponse({ success: false, error: error instanceof Error ? error.message : 'Failed to get session config' }, 500);
+        }
+      }
+
       // GET /api/agent/:name - Get agent detail
       if (pathname.startsWith('/api/agent/') && request.method === 'GET') {
         try {
@@ -4454,18 +4605,47 @@ async function main() {
         try {
           const payload = (await request.json()) as {
             message: string;
-            source: 'telegram_private' | 'telegram_group';
+            source: 'telegram_private' | 'telegram_group' | 'feishu_private' | 'feishu_group';
             sourceId: string;
             senderName?: string;
             permissionMode?: string;
             providerEnv?: ProviderEnv;
+            model?: string;
             images?: Array<{ name: string; mimeType: string; data: string }>;
+            botId?: string;
           };
 
           const hasContent = payload.message?.trim() || (payload.images && payload.images.length > 0);
           if (!hasContent) {
             return jsonResponse({ success: false, error: 'Message or images required' }, 400);
           }
+
+          // Set IM cron context for the im-cron tool (v0.1.21)
+          if (payload.botId && process.env.MYAGENTS_MANAGEMENT_PORT) {
+            const { getSessionModel } = await import('./agent-session');
+            setImCronContext({
+              botId: payload.botId,
+              chatId: payload.sourceId,
+              platform: payload.source.split('_')[0], // "telegram" or "feishu"
+              workspacePath: agentDir,
+              model: payload.model ?? getSessionModel(),
+              permissionMode: payload.permissionMode,
+              providerEnv: payload.providerEnv ? {
+                baseUrl: payload.providerEnv.baseUrl,
+                apiKey: payload.providerEnv.apiKey,
+                authType: payload.providerEnv.authType,
+                apiProtocol: payload.providerEnv.apiProtocol,
+              } : undefined,
+            });
+          }
+
+          // Ensure IM session always has HEARTBEAT system prompt appended.
+          // This is idempotent — only takes effect when query() is created (first message).
+          // Must be set BEFORE enqueueUserMessage so startStreamingSession() picks it up.
+          setSystemPromptConfig({
+            mode: 'append',
+            content: `\n\n## HEARTBEAT 心跳机制\n\nYou will periodically receive heartbeat messages (a user message wrapped in tags like \`<HEARTBEAT>\\nThis is a heartbeat from the system.\\n……\\n</HEARTBEAT>\`).\nWhen you receive one, follow its instructions.`,
+          });
 
           const metadata = {
             source: payload.source,
@@ -4478,7 +4658,7 @@ async function main() {
             payload.message || '',
             payload.images, // forward image attachments from Telegram
             (payload.permissionMode as PermissionMode) ?? 'plan',
-            undefined, // model: already set via /api/model/set, not per-message
+            payload.model ?? undefined, // model: per-message from Rust /model command
             payload.providerEnv ?? undefined, // providerEnv: forwarded from Rust IM
             metadata,
           );
@@ -4571,6 +4751,9 @@ async function main() {
                     sessionId: getSessionId(),
                   });
                   closeStream();
+                } else if (event === 'activity') {
+                  // Non-text block started (thinking, tool_use) — Rust uses this for placeholder
+                  sendEvent({ type: 'activity' });
                 } else if (event === 'error') {
                   sendEvent({ type: 'error', error: data });
                   closeStream();
@@ -4599,6 +4782,132 @@ async function main() {
             { success: false, error: error instanceof Error ? error.message : 'IM chat error' },
             500,
           );
+        }
+      }
+
+      // POST /api/im/heartbeat — Execute a heartbeat check (synchronous JSON response, not SSE)
+      if (pathname === '/api/im/heartbeat' && request.method === 'POST') {
+        try {
+          const payload = await request.json() as {
+            prompt: string;
+            source: string;
+            sourceId: string;
+            ackMaxChars?: number;
+            isHighPriority?: boolean;
+          };
+
+          if (!payload.prompt) {
+            return jsonResponse({ status: 'silent', reason: 'empty' });
+          }
+
+          // --- Gate: Read HEARTBEAT.md from workspace root ---
+          // The actual checklist lives in HEARTBEAT.md, not in config.
+          // If the file is empty/missing AND no system events AND not high-priority → skip AI call.
+          const heartbeatMdPath = `${currentAgentDir}/HEARTBEAT.md`;
+          let heartbeatMdContent = '';
+          try {
+            heartbeatMdContent = readFileSync(heartbeatMdPath, 'utf-8').trim();
+          } catch {
+            // File doesn't exist — create an empty one so the user knows where to edit
+            try {
+              writeFileSync(heartbeatMdPath, '', 'utf-8');
+              console.log(`[im/heartbeat] Created empty HEARTBEAT.md at ${heartbeatMdPath}`);
+            } catch (writeErr) {
+              console.warn(`[im/heartbeat] Failed to create HEARTBEAT.md: ${writeErr}`);
+            }
+          }
+
+          // Drain pending system events
+          const pendingEvents = drainSystemEvents();
+
+          // Skip AI call if HEARTBEAT.md is empty AND no system events AND not high-priority
+          if (!heartbeatMdContent && pendingEvents.length === 0 && !payload.isHighPriority) {
+            console.log('[im/heartbeat] Skipped: HEARTBEAT.md is empty and no pending events');
+            return jsonResponse({ status: 'silent', reason: 'empty_heartbeat_md' });
+          }
+
+          // Build enriched prompt: wrap in <HEARTBEAT> tags
+          let enrichedPrompt = payload.prompt;
+          if (pendingEvents.length > 0) {
+            const eventLines = pendingEvents.map(
+              e => `[System Event: ${e.event}] ${e.content}`
+            ).join('\n');
+            enrichedPrompt += `\n\n${eventLines}`;
+          }
+          // Wrap the entire heartbeat message in <HEARTBEAT> tags
+          enrichedPrompt = `<HEARTBEAT>\n${enrichedPrompt}\n</HEARTBEAT>`;
+
+          const {
+            enqueueUserMessage, waitForSessionIdle, getMessages,
+          } = await import('./agent-session');
+
+          // Inject heartbeat prompt as user message (wrapped in <HEARTBEAT> tags)
+          // System prompt is already permanently injected at IM session creation (/api/im/chat)
+          await enqueueUserMessage(
+            enrichedPrompt,
+            [],
+            'auto',
+            undefined,
+            undefined,
+            {
+              source: payload.source as 'desktop' | 'telegram_private' | 'telegram_group' | 'feishu_private' | 'feishu_group',
+              sourceId: payload.sourceId,
+            },
+          );
+
+          // Wait for AI to finish (5 min timeout)
+          const completed = await waitForSessionIdle(300000, 500);
+
+          if (!completed) {
+            return jsonResponse({ status: 'error', text: 'Heartbeat timeout' });
+          }
+
+          // Get last assistant message
+          const messages = getMessages();
+          const lastMsg = [...messages].reverse().find(m => m.role === 'assistant');
+
+          if (!lastMsg) {
+            return jsonResponse({ status: 'silent', reason: 'no_response' });
+          }
+
+          // Extract text content from message
+          let text = '';
+          if (typeof lastMsg.content === 'string') {
+            text = lastMsg.content;
+          } else if (Array.isArray(lastMsg.content)) {
+            text = lastMsg.content
+              .filter((b: { type: string }) => b.type === 'text')
+              .map((b: { type: string; text?: string }) => b.text || '')
+              .join('\n');
+          }
+
+          // Check HEARTBEAT_OK
+          const ackMaxChars = payload.ackMaxChars ?? 300;
+          const result = stripHeartbeatToken(text, ackMaxChars);
+
+          return jsonResponse(result);
+        } catch (error) {
+          console.error('[im/heartbeat] Error:', error);
+          return jsonResponse(
+            { status: 'error', text: error instanceof Error ? error.message : 'Heartbeat error' },
+            500,
+          );
+        }
+      }
+
+      // POST /api/im/system-event — Receive system events (e.g. cron task completion) for heartbeat relay
+      if (pathname === '/api/im/system-event' && request.method === 'POST') {
+        try {
+          const { event, content } = (await request.json()) as {
+            event: string;
+            content: string;
+          };
+          // Store in queue for next heartbeat to pick up
+          systemEventQueue.push({ event, content, timestamp: Date.now() });
+          console.log(`[system-event] Queued: ${event} (queue size: ${systemEventQueue.length})`);
+          return jsonResponse({ ok: true });
+        } catch (_err) {
+          return jsonResponse({ error: 'Invalid request' }, 400);
         }
       }
 
@@ -4686,6 +4995,43 @@ async function main() {
       }
 
       // ============= END IM BOT API =============
+
+      // ============= OPENAI BRIDGE (Loopback) =============
+      // SDK subprocess sends Anthropic requests here when provider uses OpenAI protocol
+      if (pathname === '/v1/messages' && request.method === 'POST') {
+        const bridgeConfig = getOpenAiBridgeConfig();
+        if (bridgeConfig) {
+          try {
+            return await bridgeHandler(request);
+          } catch (error) {
+            console.error('[bridge] Handler error:', error);
+            return jsonResponse(
+              { type: 'error', error: { type: 'api_error', message: error instanceof Error ? error.message : 'Bridge error' } },
+              500,
+            );
+          }
+        }
+        // Bridge not active — fall through to 404
+      }
+
+      // POST /v1/messages/count_tokens — CLI sends this for context window management.
+      // OpenAI-compatible APIs have no equivalent, so return an estimated token count.
+      if (pathname === '/v1/messages/count_tokens' && request.method === 'POST') {
+        const bridgeConfig = getOpenAiBridgeConfig();
+        if (bridgeConfig) {
+          try {
+            const body = await request.json() as { messages?: unknown[]; system?: unknown; tools?: unknown[] };
+            // Rough estimate: serialize content → chars / 4 ≈ tokens
+            const contentLength = JSON.stringify(body.messages ?? []).length
+              + JSON.stringify(body.system ?? '').length
+              + JSON.stringify(body.tools ?? []).length;
+            const estimatedTokens = Math.max(1, Math.ceil(contentLength / 4));
+            return jsonResponse({ input_tokens: estimatedTokens });
+          } catch {
+            return jsonResponse({ input_tokens: 1024 }); // Safe fallback
+          }
+        }
+      }
 
       const staticResponse = await serveStatic(pathname);
       if (staticResponse) {

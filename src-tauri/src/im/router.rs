@@ -201,13 +201,41 @@ impl SessionRouter {
     }
 
     /// Record a successful AI response — increment message_count and refresh activity.
-    /// Note: session_id is NOT updated from the SSE response. The PeerSession.session_id
-    /// is the Sidecar manager key (set at Sidecar creation time via --session-id).
-    /// Overwriting it would cause a key mismatch on Sidecar restart.
+    /// Note: session_id is NOT updated here. Use `upgrade_peer_session_id` when the
+    /// Bun sidecar creates a new session internally (e.g., provider switch).
     pub fn record_response(&mut self, session_key: &str, _session_id: Option<&str>) {
         if let Some(ps) = self.peer_sessions.get_mut(session_key) {
             ps.message_count += 1;
             ps.last_active = Instant::now();
+        }
+    }
+
+    /// Upgrade a peer's session_id when the Bun sidecar internally created a new session
+    /// (e.g., provider switch third-party → Anthropic). Also upgrades the Sidecar Manager key.
+    /// Returns true if the session_id was actually changed.
+    pub fn upgrade_peer_session_id(
+        &mut self,
+        session_key: &str,
+        new_session_id: &str,
+        manager: &ManagedSidecarManager,
+    ) -> bool {
+        if let Some(ps) = self.peer_sessions.get_mut(session_key) {
+            if ps.session_id == new_session_id {
+                return false; // no change
+            }
+            let old_id = ps.session_id.clone();
+            {
+                let mut mgr = manager.lock().unwrap();
+                mgr.upgrade_session_id(&old_id, new_session_id);
+            }
+            ps.session_id = new_session_id.to_string();
+            ulog_info!(
+                "[im-router] Upgraded peer session_id: {} -> {} (session_key={})",
+                old_id, new_session_id, session_key,
+            );
+            true
+        } else {
+            false
         }
     }
 
@@ -236,6 +264,19 @@ impl SessionRouter {
     ) -> Result<String, String> {
         if let Some(ps) = self.peer_sessions.get(session_key) {
             let old_session_id = ps.session_id.clone();
+
+            // Sidecar not running (restored from disk after app restart, or idle-collected).
+            // Just reset session metadata; next message will start a fresh sidecar with the new ID.
+            if ps.sidecar_port == 0 {
+                let new_session_id = uuid::Uuid::new_v4().to_string();
+                if let Some(ps) = self.peer_sessions.get_mut(session_key) {
+                    ps.session_id = new_session_id.clone();
+                    ps.message_count = 0;
+                    ps.last_active = Instant::now();
+                }
+                return Ok(new_session_id);
+            }
+
             let url = format!("http://127.0.0.1:{}/api/im/session/new", ps.sidecar_port);
             let resp = self
                 .http_client
@@ -356,6 +397,40 @@ impl SessionRouter {
         &self.default_workspace
     }
 
+    /// Find any active session with a running Sidecar.
+    /// Returns (port, source_string, source_id) for cron tasks etc.
+    /// Picks the most recently active session for deterministic behavior.
+    pub fn find_any_active_session(&self) -> Option<(u16, String, String)> {
+        self.peer_sessions
+            .values()
+            .filter(|ps| ps.sidecar_port > 0)
+            .max_by_key(|ps| ps.last_active)
+            .map(|ps| {
+                (ps.sidecar_port, session_key_to_source_str(&ps.session_key), ps.source_id.clone())
+            })
+    }
+
+    /// Find any peer session (regardless of sidecar status).
+    /// Returns (session_key, source_string, source_id).
+    /// Used by heartbeat/cron to find a session to wake up even if sidecar was idle-collected.
+    /// Picks the most recently active session for deterministic behavior.
+    pub fn find_any_peer_session(&self) -> Option<(String, String, String)> {
+        self.peer_sessions
+            .values()
+            .max_by_key(|ps| ps.last_active)
+            .map(|ps| {
+                (ps.session_key.clone(), session_key_to_source_str(&ps.session_key), ps.source_id.clone())
+            })
+    }
+
+    /// Touch session activity timestamp to prevent idle collection.
+    /// Called after heartbeat successfully uses a sidecar.
+    pub fn touch_session_activity(&mut self, session_key: &str) {
+        if let Some(ps) = self.peer_sessions.get_mut(session_key) {
+            ps.last_active = Instant::now();
+        }
+    }
+
     /// Get active peer session info (for health state)
     pub fn active_sessions(&self) -> Vec<super::types::ImActiveSession> {
         self.peer_sessions
@@ -405,6 +480,27 @@ impl SessionRouter {
         }
     }
 
+    /// Get all unique active Sidecar ports (for hot-reload config broadcast).
+    pub fn active_sidecar_ports(&self) -> Vec<u16> {
+        let mut seen = std::collections::HashSet::new();
+        self.peer_sessions
+            .values()
+            .filter(|ps| ps.sidecar_port > 0)
+            .filter_map(|ps| {
+                if seen.insert(ps.sidecar_port) {
+                    Some(ps.sidecar_port)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Update default workspace path (hot-reload, only affects new sessions).
+    pub fn set_default_workspace(&mut self, path: PathBuf) {
+        self.default_workspace = path;
+    }
+
     /// Sync AI config (model + MCP) to a newly created Sidecar.
     /// Called after ensure_sidecar returns is_new=true.
     pub async fn sync_ai_config(
@@ -443,6 +539,21 @@ impl SessionRouter {
                 let _ = release_session_sidecar(manager, &ps.session_id, &owner);
             }
         }
+    }
+}
+
+/// Derive source string (e.g. "telegram_private") from session key.
+fn session_key_to_source_str(session_key: &str) -> String {
+    if session_key.contains("telegram") && session_key.contains("private") {
+        "telegram_private".to_string()
+    } else if session_key.contains("telegram") && session_key.contains("group") {
+        "telegram_group".to_string()
+    } else if session_key.contains("feishu") && session_key.contains("private") {
+        "feishu_private".to_string()
+    } else if session_key.contains("feishu") && session_key.contains("group") {
+        "feishu_group".to_string()
+    } else {
+        "telegram_private".to_string()
     }
 }
 

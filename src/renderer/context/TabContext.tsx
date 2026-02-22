@@ -33,7 +33,9 @@ export interface TabState {
     sessionId: string | null;
 
     // Chat state
-    messages: Message[];
+    messages: Message[];           // Combined view (history + streaming) for backward compat
+    historyMessages: Message[];    // Immutable during streaming — zero re-render for history
+    streamingMessage: Message | null;  // Only this updates during streaming
     isLoading: boolean;
     sessionState: SessionState;
 
@@ -89,7 +91,7 @@ export interface TabContextValue extends TabState {
     disconnectSse: () => void;
 
     // Chat actions
-    sendMessage: (text: string, images?: ImageAttachment[], permissionMode?: PermissionMode, model?: string, providerEnv?: { baseUrl?: string; apiKey?: string; authType?: 'auth_token' | 'api_key' | 'both' | 'auth_token_clear_api_key' }, isCron?: boolean) => Promise<boolean>;
+    sendMessage: (text: string, images?: ImageAttachment[], permissionMode?: PermissionMode, model?: string, providerEnv?: { baseUrl?: string; apiKey?: string; authType?: 'auth_token' | 'api_key' | 'both' | 'auth_token_clear_api_key'; apiProtocol?: 'anthropic' | 'openai' }, isCron?: boolean) => Promise<boolean>;
     stopResponse: () => Promise<boolean>;
     loadSession: (sessionId: string, options?: { skipLoadingReset?: boolean }) => Promise<boolean>;
     resetSession: () => Promise<boolean>;
@@ -122,6 +124,8 @@ const defaultContextValue: TabContextValue = {
     agentDir: '',
     sessionId: null,
     messages: [],
+    historyMessages: [],
+    streamingMessage: null,
     isLoading: false,
     sessionState: 'idle',
     logs: [],
