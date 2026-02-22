@@ -253,7 +253,11 @@ export default function ImBotDetail({
                 await invoke('cmd_start_im_bot', params);
                 if (isMountedRef.current) {
                     toastRef.current.success('Bot 已启动');
-                    await saveBotField({ enabled: true, providerEnvJson: params.providerEnvJson || undefined });
+                    await saveBotField({
+                        enabled: true,
+                        providerEnvJson: params.providerEnvJson || undefined,
+                        availableProvidersJson: params.availableProvidersJson || undefined,
+                    });
                 }
             }
         } catch (err) {
@@ -566,8 +570,6 @@ export default function ImBotDetail({
                             apiProtocol: provider.apiProtocol,
                         });
                     }
-                    // Persist providerId + model + providerEnvJson (undefined clears old value)
-                    await saveBotField({ providerId: providerId || undefined, model: newModel, providerEnvJson });
                     const availableProvidersList = providers
                         .filter(p => p.type === 'subscription' || (p.type === 'api' && apiKeys[p.id]))
                         .map(p => ({
@@ -576,6 +578,9 @@ export default function ImBotDetail({
                             apiKey: p.type !== 'subscription' ? apiKeys[p.id] : undefined,
                             models: p.models.map(m => ({ model: m.model, modelName: m.modelName })),
                         }));
+                    // Persist providerId + model + providerEnvJson + availableProvidersJson
+                    const availableProvidersJsonStr = availableProvidersList.length > 0 ? JSON.stringify(availableProvidersList) : undefined;
+                    await saveBotField({ providerId: providerId || undefined, model: newModel, providerEnvJson, availableProvidersJson: availableProvidersJsonStr });
                     await hotUpdateRunning('cmd_update_im_bot_ai_config', {
                         model: newModel || null,
                         // Empty string = explicit clear (subscription); null would mean "don't change"
