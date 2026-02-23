@@ -18,6 +18,7 @@ import { createSseConnection, type SseConnection } from '@/api/SseConnection';
 import type { ImageAttachment } from '@/components/SimpleChatInput';
 import type { PermissionRequest } from '@/components/PermissionPrompt';
 import type { AskUserQuestionRequest, AskUserQuestion } from '../../shared/types/askUserQuestion';
+import type { ExitPlanModeRequest, EnterPlanModeRequest, ExitPlanModeAllowedPrompt } from '../../shared/types/planMode';
 import { CUSTOM_EVENTS, isPendingSessionId } from '../../shared/constants';
 import { TabContext, TabApiContext, TabActiveContext, type SessionState, type TabContextValue, type TabApiContextValue } from './TabContext';
 import type { Message, ContentBlock, ToolUseSimple, ToolInput, TaskStats, SubagentToolCall } from '@/types/chat';
@@ -33,6 +34,7 @@ import {
     notifyMessageComplete,
     notifyPermissionRequest,
     notifyAskUserQuestion,
+    notifyPlanModeRequest,
 } from '@/services/notificationService';
 
 // File-modifying tools that should trigger workspace refresh
@@ -262,6 +264,8 @@ export default function TabProvider({
     const [isConnected, setIsConnected] = useState(false);
     const [pendingPermission, setPendingPermission] = useState<PermissionRequest | null>(null);
     const [pendingAskUserQuestion, setPendingAskUserQuestion] = useState<AskUserQuestionRequest | null>(null);
+    const [pendingExitPlanMode, setPendingExitPlanMode] = useState<ExitPlanModeRequest | null>(null);
+    const [pendingEnterPlanMode, setPendingEnterPlanMode] = useState<EnterPlanModeRequest | null>(null);
     const [toolCompleteCount, setToolCompleteCount] = useState(0);
     const [queuedMessages, setQueuedMessages] = useState<QueuedMessageInfo[]>([]);
     const queuedMessagesRef = useRef<QueuedMessageInfo[]>([]);
@@ -329,6 +333,8 @@ export default function TabProvider({
         // Clear pending prompts to prevent stale UI
         setPendingPermission(null);
         setPendingAskUserQuestion(null);
+        setPendingExitPlanMode(null);
+        setPendingEnterPlanMode(null);
         // Clear queued messages
         setQueuedMessages([]);
         // Clear current session ID - no active session until first message creates one
@@ -1116,6 +1122,28 @@ export default function TabProvider({
                 break;
             }
 
+            case 'exit-plan-mode:request': {
+                const payload = data as { requestId: string; plan?: string; allowedPrompts?: ExitPlanModeAllowedPrompt[] } | null;
+                if (payload?.requestId) {
+                    setPendingExitPlanMode({
+                        requestId: payload.requestId,
+                        plan: payload.plan,
+                        allowedPrompts: payload.allowedPrompts,
+                    });
+                    notifyPlanModeRequest();
+                }
+                break;
+            }
+
+            case 'enter-plan-mode:request': {
+                const payload = data as { requestId: string } | null;
+                if (payload?.requestId) {
+                    setPendingEnterPlanMode({ requestId: payload.requestId });
+                    notifyPlanModeRequest();
+                }
+                break;
+            }
+
             // Queue events
             case 'queue:added': {
                 // A message was queued — add to frontend queue state for UI rendering.
@@ -1682,6 +1710,30 @@ export default function TabProvider({
         }
     }, [pendingAskUserQuestion, postJson]);
 
+    // Respond to ExitPlanMode request
+    const respondExitPlanMode = useCallback(async (approved: boolean) => {
+        if (!pendingExitPlanMode) return;
+        const requestId = pendingExitPlanMode.requestId;
+        setPendingExitPlanMode(null);
+        try {
+            await postJson('/api/exit-plan-mode/respond', { requestId, approved });
+        } catch (error) {
+            console.error('[TabProvider] Failed to send ExitPlanMode response:', error);
+        }
+    }, [pendingExitPlanMode, postJson]);
+
+    // Respond to EnterPlanMode request
+    const respondEnterPlanMode = useCallback(async (approved: boolean) => {
+        if (!pendingEnterPlanMode) return;
+        const requestId = pendingEnterPlanMode.requestId;
+        setPendingEnterPlanMode(null);
+        try {
+            await postJson('/api/enter-plan-mode/respond', { requestId, approved });
+        } catch (error) {
+            console.error('[TabProvider] Failed to send EnterPlanMode response:', error);
+        }
+    }, [pendingEnterPlanMode, postJson]);
+
     // Context value - use currentSessionId (which tracks the actually loaded session)
     const contextValue: TabContextValue = useMemo(() => ({
         tabId,
@@ -1699,6 +1751,8 @@ export default function TabProvider({
         systemStatus,
         pendingPermission,
         pendingAskUserQuestion,
+        pendingExitPlanMode,
+        pendingEnterPlanMode,
         toolCompleteCount,
         queuedMessages,
         isConnected,
@@ -1723,15 +1777,17 @@ export default function TabProvider({
         apiDelete: apiDeleteJson,
         respondPermission,
         respondAskUserQuestion,
+        respondExitPlanMode,
+        respondEnterPlanMode,
         cancelQueuedMessage,
         forceExecuteQueuedMessage,
         // Cron task exit handler ref (mutable, no need in deps)
         onCronTaskExitRequested: onCronTaskExitRequestedRef,
     }), [
         tabId, agentDir, currentSessionId, messages, historyMessages, streamingMessage, isLoading, sessionState,
-        logs, unifiedLogs, systemInitInfo, agentError, systemStatus, pendingPermission, pendingAskUserQuestion, toolCompleteCount, queuedMessages, isConnected,
+        logs, unifiedLogs, systemInitInfo, agentError, systemStatus, pendingPermission, pendingAskUserQuestion, pendingExitPlanMode, pendingEnterPlanMode, toolCompleteCount, queuedMessages, isConnected,
         setMessages, appendLog, appendUnifiedLog, clearUnifiedLogs, connectSse, disconnectSse, sendMessage, stopResponse, loadSession, resetSession,
-        apiGetJson, postJson, apiPutJson, apiDeleteJson, respondPermission, respondAskUserQuestion, cancelQueuedMessage, forceExecuteQueuedMessage
+        apiGetJson, postJson, apiPutJson, apiDeleteJson, respondPermission, respondAskUserQuestion, respondExitPlanMode, respondEnterPlanMode, cancelQueuedMessage, forceExecuteQueuedMessage
     ]);
 
     // Lightweight API-only context value — deps are all stable (created once per tabId),

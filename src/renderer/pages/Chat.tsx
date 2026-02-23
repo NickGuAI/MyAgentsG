@@ -64,6 +64,10 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
     systemStatus,
     pendingPermission,
     pendingAskUserQuestion,
+    pendingExitPlanMode,
+    pendingEnterPlanMode,
+    respondExitPlanMode,
+    respondEnterPlanMode,
     toolCompleteCount,
     setMessages,
     setIsLoading,
@@ -981,6 +985,22 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
     void respondAskUserQuestion(null);
   }, [respondAskUserQuestion]);
 
+  const handleExitPlanModeApprove = useCallback(() => {
+    void respondExitPlanMode(true);
+  }, [respondExitPlanMode]);
+
+  const handleExitPlanModeReject = useCallback(() => {
+    void respondExitPlanMode(false);
+  }, [respondExitPlanMode]);
+
+  const handleEnterPlanModeApprove = useCallback(() => {
+    void respondEnterPlanMode(true);
+  }, [respondEnterPlanMode]);
+
+  const handleEnterPlanModeReject = useCallback(() => {
+    void respondEnterPlanMode(false);
+  }, [respondEnterPlanMode]);
+
   // Stable callback for time rewind — uses ref for messages to keep reference stable
   const handleRewind = useCallback((messageId: string) => {
     const msgs = messagesRef.current;
@@ -1226,6 +1246,12 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
               pendingAskUserQuestion={pendingAskUserQuestion}
               onAskUserQuestionSubmit={handleAskUserQuestionSubmit}
               onAskUserQuestionCancel={handleAskUserQuestionCancel}
+              pendingExitPlanMode={pendingExitPlanMode}
+              onExitPlanModeApprove={handleExitPlanModeApprove}
+              onExitPlanModeReject={handleExitPlanModeReject}
+              pendingEnterPlanMode={pendingEnterPlanMode}
+              onEnterPlanModeApprove={handleEnterPlanModeApprove}
+              onEnterPlanModeReject={handleEnterPlanModeReject}
               systemStatus={rewindStatus || systemStatus}
               isStreaming={isLoading || sessionState === 'running'}
               onRewind={handleRewind}

@@ -2903,6 +2903,32 @@ async function main() {
           return jsonResponse({ success: false, error: String(error) }, 500);
         }
       }
+      // POST /api/exit-plan-mode/respond - Handle user's approval/rejection of ExitPlanMode
+      if (pathname === '/api/exit-plan-mode/respond' && request.method === 'POST') {
+        try {
+          const payload = await request.json() as { requestId: string; approved: boolean };
+          const { handleExitPlanModeResponse } = await import('./agent-session');
+          const success = handleExitPlanModeResponse(payload.requestId, payload.approved);
+          return jsonResponse({ success });
+        } catch (error) {
+          console.error('[api/exit-plan-mode] Error:', error);
+          return jsonResponse({ success: false, error: String(error) }, 500);
+        }
+      }
+
+      // POST /api/enter-plan-mode/respond - Handle user's approval/rejection of EnterPlanMode
+      if (pathname === '/api/enter-plan-mode/respond' && request.method === 'POST') {
+        try {
+          const payload = await request.json() as { requestId: string; approved: boolean };
+          const { handleEnterPlanModeResponse } = await import('./agent-session');
+          const success = handleEnterPlanModeResponse(payload.requestId, payload.approved);
+          return jsonResponse({ success });
+        } catch (error) {
+          console.error('[api/enter-plan-mode] Error:', error);
+          return jsonResponse({ success: false, error: String(error) }, 500);
+        }
+      }
+
       // ============= END MCP API =============
 
       // ============= SLASH COMMANDS API =============

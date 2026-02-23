@@ -909,10 +909,28 @@ const pendingPermissions = new Map<string, {
 import type { AskUserQuestionInput } from '../shared/types/askUserQuestion';
 export type { AskUserQuestionInput, AskUserQuestion, AskUserQuestionOption } from '../shared/types/askUserQuestion';
 
+// PlanMode types - import from shared
+import type { ExitPlanModeAllowedPrompt } from '../shared/types/planMode';
+export type { ExitPlanModeRequest, EnterPlanModeRequest, ExitPlanModeAllowedPrompt } from '../shared/types/planMode';
+
 // Pending AskUserQuestion requests waiting for user response
 const pendingAskUserQuestions = new Map<string, {
   resolve: (answers: Record<string, string> | null) => void;
   input: AskUserQuestionInput;
+  timer: ReturnType<typeof setTimeout>;
+}>();
+
+// Pending ExitPlanMode requests waiting for user approval
+const pendingExitPlanMode = new Map<string, {
+  resolve: (approved: boolean) => void;
+  plan?: string;
+  allowedPrompts?: ExitPlanModeAllowedPrompt[];
+  timer: ReturnType<typeof setTimeout>;
+}>();
+
+// Pending EnterPlanMode requests waiting for user approval
+const pendingEnterPlanMode = new Map<string, {
+  resolve: (approved: boolean) => void;
   timer: ReturnType<typeof setTimeout>;
 }>();
 
@@ -1020,6 +1038,122 @@ export function handleAskUserQuestionResponse(
     pending.resolve(answers);
   }
 
+  return true;
+}
+
+/**
+ * Handle ExitPlanMode tool - AI submits a plan for user review
+ */
+async function handleExitPlanMode(
+  input: unknown,
+  signal?: AbortSignal
+): Promise<boolean> {
+  console.log('[ExitPlanMode] Requesting user approval');
+
+  const obj = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
+  const plan = typeof obj.plan === 'string' ? obj.plan : undefined;
+  const allowedPrompts = Array.isArray(obj.allowedPrompts)
+    ? (obj.allowedPrompts as ExitPlanModeAllowedPrompt[])
+    : undefined;
+
+  const requestId = `exitplan_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+  broadcast('exit-plan-mode:request', { requestId, plan, allowedPrompts });
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      if (pendingExitPlanMode.has(requestId)) {
+        cleanup();
+        console.warn('[ExitPlanMode] Timed out after 10 minutes');
+        resolve(false);
+      }
+    }, 10 * 60 * 1000);
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      pendingExitPlanMode.delete(requestId);
+      signal?.removeEventListener('abort', onAbort);
+    };
+
+    const onAbort = () => {
+      console.debug('[ExitPlanMode] Aborted by SDK signal');
+      cleanup();
+      resolve(false);
+    };
+
+    signal?.addEventListener('abort', onAbort);
+    pendingExitPlanMode.set(requestId, { resolve, plan, allowedPrompts, timer });
+  });
+}
+
+/**
+ * Handle user's ExitPlanMode response from frontend
+ */
+export function handleExitPlanModeResponse(requestId: string, approved: boolean): boolean {
+  console.debug(`[ExitPlanMode] handleResponse: requestId=${requestId}, approved=${approved}`);
+  const pending = pendingExitPlanMode.get(requestId);
+  if (!pending) {
+    console.warn(`[ExitPlanMode] Unknown request: ${requestId}`);
+    return false;
+  }
+  clearTimeout(pending.timer);
+  pendingExitPlanMode.delete(requestId);
+  pending.resolve(approved);
+  return true;
+}
+
+/**
+ * Handle EnterPlanMode tool - AI requests to enter plan mode
+ */
+async function handleEnterPlanMode(
+  _input: unknown,
+  signal?: AbortSignal
+): Promise<boolean> {
+  console.log('[EnterPlanMode] Requesting user approval');
+
+  const requestId = `enterplan_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+  broadcast('enter-plan-mode:request', { requestId });
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      if (pendingEnterPlanMode.has(requestId)) {
+        cleanup();
+        console.warn('[EnterPlanMode] Timed out after 10 minutes');
+        resolve(false);
+      }
+    }, 10 * 60 * 1000);
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      pendingEnterPlanMode.delete(requestId);
+      signal?.removeEventListener('abort', onAbort);
+    };
+
+    const onAbort = () => {
+      console.debug('[EnterPlanMode] Aborted by SDK signal');
+      cleanup();
+      resolve(false);
+    };
+
+    signal?.addEventListener('abort', onAbort);
+    pendingEnterPlanMode.set(requestId, { resolve, timer });
+  });
+}
+
+/**
+ * Handle user's EnterPlanMode response from frontend
+ */
+export function handleEnterPlanModeResponse(requestId: string, approved: boolean): boolean {
+  console.debug(`[EnterPlanMode] handleResponse: requestId=${requestId}, approved=${approved}`);
+  const pending = pendingEnterPlanMode.get(requestId);
+  if (!pending) {
+    console.warn(`[EnterPlanMode] Unknown request: ${requestId}`);
+    return false;
+  }
+  clearTimeout(pending.timer);
+  pendingEnterPlanMode.delete(requestId);
+  pending.resolve(approved);
   return true;
 }
 
@@ -1190,6 +1324,8 @@ export function clearSessionPermissions(): void {
   sessionAlwaysAllowed.clear();
   pendingPermissions.clear();
   pendingAskUserQuestions.clear();
+  pendingExitPlanMode.clear();
+  pendingEnterPlanMode.clear();
 }
 
 /**
@@ -1197,10 +1333,10 @@ export function clearSessionPermissions(): void {
  * Used to replay these to newly connected SSE clients (e.g., Tab joining shared session).
  */
 export function getPendingInteractiveRequests(): Array<{
-  type: 'permission:request' | 'ask-user-question:request';
+  type: 'permission:request' | 'ask-user-question:request' | 'exit-plan-mode:request' | 'enter-plan-mode:request';
   data: unknown;
 }> {
-  const result: Array<{ type: 'permission:request' | 'ask-user-question:request'; data: unknown }> = [];
+  const result: Array<{ type: 'permission:request' | 'ask-user-question:request' | 'exit-plan-mode:request' | 'enter-plan-mode:request'; data: unknown }> = [];
   for (const [requestId, p] of pendingPermissions) {
     result.push({
       type: 'permission:request',
@@ -1215,6 +1351,18 @@ export function getPendingInteractiveRequests(): Array<{
     result.push({
       type: 'ask-user-question:request',
       data: { requestId, questions: q.input.questions },
+    });
+  }
+  for (const [requestId, p] of pendingExitPlanMode) {
+    result.push({
+      type: 'exit-plan-mode:request',
+      data: { requestId, plan: p.plan, allowedPrompts: p.allowedPrompts },
+    });
+  }
+  for (const [requestId] of pendingEnterPlanMode) {
+    result.push({
+      type: 'enter-plan-mode:request',
+      data: { requestId },
     });
   }
   return result;
@@ -3288,6 +3436,32 @@ async function startStreamingSession(preWarm = false): Promise<void> {
           return {
             behavior: 'allow' as const,
             updatedInput: { ...inputWithAnswers, answers }
+          };
+        }
+
+        // Special handling for ExitPlanMode - user reviews the plan
+        if (toolName === 'ExitPlanMode') {
+          console.log('[canUseTool] ExitPlanMode detected, requesting user approval');
+          const approved = await handleExitPlanMode(input, options.signal);
+          if (!approved) {
+            return { behavior: 'deny' as const, message: '用户拒绝了方案' };
+          }
+          return {
+            behavior: 'allow' as const,
+            updatedInput: input as Record<string, unknown>
+          };
+        }
+
+        // Special handling for EnterPlanMode - user approves entering plan mode
+        if (toolName === 'EnterPlanMode') {
+          console.log('[canUseTool] EnterPlanMode detected, requesting user approval');
+          const approved = await handleEnterPlanMode(input, options.signal);
+          if (!approved) {
+            return { behavior: 'deny' as const, message: '用户拒绝进入计划模式' };
+          }
+          return {
+            behavior: 'allow' as const,
+            updatedInput: input as Record<string, unknown>
           };
         }
 

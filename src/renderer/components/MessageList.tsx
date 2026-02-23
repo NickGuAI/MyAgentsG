@@ -4,6 +4,9 @@ import { memo, useMemo, useState, useEffect, useRef, type CSSProperties, type Re
 import Message from '@/components/Message';
 import { PermissionPrompt, type PermissionRequest } from '@/components/PermissionPrompt';
 import { AskUserQuestionPrompt, type AskUserQuestionRequest } from '@/components/AskUserQuestionPrompt';
+import { EnterPlanModePrompt } from '@/components/EnterPlanModePrompt';
+import { ExitPlanModePrompt } from '@/components/ExitPlanModePrompt';
+import type { ExitPlanModeRequest, EnterPlanModeRequest } from '../../shared/types/planMode';
 import type { Message as MessageType } from '@/types/chat';
 
 /**
@@ -37,6 +40,12 @@ interface MessageListProps {
   pendingAskUserQuestion?: AskUserQuestionRequest | null;
   onAskUserQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
   onAskUserQuestionCancel?: (requestId: string) => void;
+  pendingExitPlanMode?: ExitPlanModeRequest | null;
+  onExitPlanModeApprove?: () => void;
+  onExitPlanModeReject?: () => void;
+  pendingEnterPlanMode?: EnterPlanModeRequest | null;
+  onEnterPlanModeApprove?: () => void;
+  onEnterPlanModeReject?: () => void;
   systemStatus?: string | null;  // SDK system status (e.g., 'compacting')
   isStreaming?: boolean;          // AI 回复中（传递给 Message 隐藏回溯按钮）
   onRewind?: (messageId: string) => void;
@@ -127,6 +136,12 @@ const MessageList = memo(function MessageList({
   pendingAskUserQuestion,
   onAskUserQuestionSubmit,
   onAskUserQuestionCancel,
+  pendingExitPlanMode,
+  onExitPlanModeApprove,
+  onExitPlanModeReject,
+  pendingEnterPlanMode,
+  onEnterPlanModeApprove,
+  onEnterPlanModeReject,
   systemStatus,
   isStreaming,
   onRewind,
@@ -187,6 +202,26 @@ const MessageList = memo(function MessageList({
               request={pendingAskUserQuestion}
               onSubmit={onAskUserQuestionSubmit}
               onCancel={onAskUserQuestionCancel}
+            />
+          </div>
+        )}
+        {/* EnterPlanMode prompt */}
+        {pendingEnterPlanMode && onEnterPlanModeApprove && onEnterPlanModeReject && (
+          <div className="py-2">
+            <EnterPlanModePrompt
+              request={pendingEnterPlanMode}
+              onApprove={onEnterPlanModeApprove}
+              onReject={onEnterPlanModeReject}
+            />
+          </div>
+        )}
+        {/* ExitPlanMode prompt */}
+        {pendingExitPlanMode && onExitPlanModeApprove && onExitPlanModeReject && (
+          <div className="py-2">
+            <ExitPlanModePrompt
+              request={pendingExitPlanMode}
+              onApprove={onExitPlanModeApprove}
+              onReject={onExitPlanModeReject}
             />
           </div>
         )}
