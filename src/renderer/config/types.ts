@@ -212,6 +212,20 @@ export interface ProxySettings {
 }
 
 /**
+ * Onboarding progress tracking (stored in AppConfig)
+ * undefined = first launch, will show onboarding
+ */
+export interface OnboardingProgress {
+  completed: boolean;
+  skipped: boolean;
+  currentStep: number;  // 0-3: api-key, workspace, brand, instruction
+  visitedPages: {
+    settings: boolean;
+    launcher: boolean;
+  };
+}
+
+/**
  * App-level configuration
  */
 export interface AppConfig {
@@ -271,6 +285,10 @@ export interface AppConfig {
   imBotConfig?: import('../../shared/types/im').ImBotConfig;
   // Multi-bot configuration (v0.1.19+)
   imBotConfigs?: import('../../shared/types/im').ImBotConfig[];
+
+  // ===== Onboarding =====
+  // undefined = first launch (show onboarding); set after first run
+  onboarding?: OnboardingProgress;
 }
 
 /**
