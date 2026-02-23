@@ -1257,8 +1257,18 @@ function persistMessagesToStorage(
     };
   });
   saveSessionMessages(sessionId, sessionMessages);
-  // Update lastActiveAt
-  updateSessionMetadata(sessionId, { lastActiveAt: new Date().toISOString() });
+  // Compute lastMessagePreview from last user message
+  let lastMessagePreview: string | undefined;
+  for (let i = sessionMessages.length - 1; i >= 0; i--) {
+    if (sessionMessages[i].role === 'user') {
+      const content = sessionMessages[i].content;
+      const text = typeof content === 'string' ? content : '';
+      lastMessagePreview = text.trim().slice(0, 60) || undefined;
+      break;
+    }
+  }
+  // Update lastActiveAt and lastMessagePreview
+  updateSessionMetadata(sessionId, { lastActiveAt: new Date().toISOString(), lastMessagePreview });
 }
 
 export function getSessionId(): string {
