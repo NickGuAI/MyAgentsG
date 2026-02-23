@@ -87,6 +87,7 @@ export default function OnboardingOverlay({
 }: OnboardingOverlayProps) {
   const [targetRect, setTargetRect] = useState<TargetRect | null>(null);
   const observerRef = useRef<ResizeObserver | null>(null);
+  const mutationObserverRef = useRef<MutationObserver | null>(null);
   const rafRef = useRef<number | null>(null);
 
   const stepDef = STEPS[currentStep];
@@ -120,6 +121,17 @@ export default function OnboardingOverlay({
       });
       observerRef.current.observe(el);
       observerRef.current.observe(document.documentElement);
+    } else if (stepDef) {
+      // Element not in DOM yet (e.g. async load). Watch for it to appear.
+      mutationObserverRef.current = new MutationObserver(() => {
+        const appeared = document.querySelector(`[data-onboarding-id="${stepDef.targetId}"]`);
+        if (!appeared) return;
+        mutationObserverRef.current?.disconnect();
+        mutationObserverRef.current = null;
+        if (rafRef.current) cancelAnimationFrame(rafRef.current);
+        rafRef.current = requestAnimationFrame(measureTarget);
+      });
+      mutationObserverRef.current.observe(document.body, { childList: true, subtree: true });
     }
 
     const handleResize = () => {
@@ -131,11 +143,13 @@ export default function OnboardingOverlay({
     return () => {
       observerRef.current?.disconnect();
       observerRef.current = null;
+      mutationObserverRef.current?.disconnect();
+      mutationObserverRef.current = null;
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       window.removeEventListener('resize', handleResize);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- stepDef is a derived constant from STEPS[currentStep]; currentStep already triggers re-run via measureTarget dep
-  }, [measureTarget, currentStep]);
+  // activeTabView triggers re-measure when user navigates to the required page
+  }, [measureTarget, currentStep, activeTabView]);
 
   if (!stepDef) return null;
 
