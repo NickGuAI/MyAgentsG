@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
@@ -58,7 +58,7 @@ build
  * Returns stdout string, or throws on error.
  */
 function runGit(args: string[], cwd: string): string {
-  return execSync(['git', ...args].join(' '), {
+  return execFileSync('git', args, {
     cwd,
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -201,7 +201,7 @@ export function handleGitSubmit(workspacePath: string, message?: string): GitSub
 
   try {
     runGit(['add', '-A'], workspacePath);
-    runGit(['commit', '-m', JSON.stringify(commitMessage)], workspacePath);
+    runGit(['commit', '-m', commitMessage], workspacePath);
 
     // Get the hash of the new commit
     const hash = runGit(['rev-parse', 'HEAD'], workspacePath).trim();
