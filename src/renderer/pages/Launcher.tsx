@@ -427,6 +427,7 @@ export default function Launcher({ onLaunchProject, isStarting, startError: _sta
                             )}
                             {projects.length > 0 && (
                                 <button
+                                    data-onboarding-id="add-workspace"
                                     onClick={handleAddProject}
                                     className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[13px] font-medium text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-contrast)] hover:text-[var(--ink)]"
                                 >
