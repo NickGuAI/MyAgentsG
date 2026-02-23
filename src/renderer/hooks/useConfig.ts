@@ -228,6 +228,7 @@ export function useConfig(): UseConfigResult {
     const saveApiKey = useCallback(async (providerId: string, apiKey: string) => {
         await saveApiKeyService(providerId, apiKey);
         setApiKeys((prev) => ({ ...prev, [providerId]: apiKey }));
+        window.dispatchEvent(new Event(CUSTOM_EVENTS.CONFIG_CHANGED));
     }, []);
 
     const deleteApiKey = useCallback(async (providerId: string) => {
