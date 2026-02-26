@@ -31,7 +31,7 @@ export interface SendMessagePayload {
     baseUrl?: string;
     apiKey?: string;
     authType?: 'auth_token' | 'api_key' | 'both' | 'auth_token_clear_api_key';
-    apiProtocol?: 'anthropic' | 'openai';
+    apiProtocol?: 'anthropic' | 'openai' | 'bedrock';
   };
 }
 

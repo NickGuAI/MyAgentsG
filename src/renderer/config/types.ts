@@ -91,8 +91,9 @@ export type ProviderAuthType = 'auth_token' | 'api_key' | 'both' | 'auth_token_c
  * API protocol type for provider communication
  * - 'anthropic': Native Anthropic Messages API (default)
  * - 'openai': OpenAI Chat Completions API (translated via built-in bridge)
+ * - 'bedrock': Claude Code Bedrock mode
  */
-export type ApiProtocol = 'anthropic' | 'openai';
+export type ApiProtocol = 'anthropic' | 'openai' | 'bedrock';
 
 /**
  * Service provider configuration
@@ -484,6 +485,25 @@ export const PRESET_PROVIDERS: Provider[] = [
       { model: 'minimax/minimax-m2.5', modelName: 'MiniMax M2.5', modelSeries: 'minimax' },
       { model: 'moonshotai/kimi-k2.5', modelName: 'Kimi K2.5', modelSeries: 'moonshot' },
       { model: 'z-ai/glm-5', modelName: 'GLM 5', modelSeries: 'zhipu' },
+    ],
+  },
+  {
+    id: 'aws-bedrock',
+    name: 'AWS Bedrock',
+    vendor: 'Amazon',
+    cloudProvider: '云服务商',
+    type: 'api',
+    primaryModel: 'global.anthropic.claude-sonnet-4-6-20251117-v1:0',
+    isBuiltin: true,
+    apiProtocol: 'bedrock',
+    websiteUrl: 'https://docs.claude.com/en/docs/claude-code/amazon-bedrock',
+    config: {
+      disableNonessential: true,
+    },
+    models: [
+      { model: 'global.anthropic.claude-sonnet-4-6-20251117-v1:0', modelName: 'Claude Sonnet 4.6 (Global)', modelSeries: 'claude' },
+      { model: 'us.anthropic.claude-opus-4-6-v1', modelName: 'Claude Opus 4.6 (US)', modelSeries: 'claude' },
+      { model: 'us.anthropic.claude-haiku-4-5-20251001-v1:0', modelName: 'Claude Haiku 4.5 (US)', modelSeries: 'claude' },
     ],
   },
   {

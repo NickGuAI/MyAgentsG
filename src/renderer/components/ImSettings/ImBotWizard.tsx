@@ -182,13 +182,14 @@ export default function ImBotWizard({
         }
 
         const availableProviders = providers
-            .filter(p => p.type === 'subscription' || (p.type === 'api' && apiKeys[p.id]))
+            .filter(p => p.type === 'subscription' || p.apiProtocol === 'bedrock' || (p.type === 'api' && apiKeys[p.id]))
             .map(p => ({
                 id: p.id,
                 name: p.name,
                 primaryModel: p.primaryModel,
                 baseUrl: p.config.baseUrl,
                 authType: p.authType,
+                apiProtocol: p.apiProtocol,
                 apiKey: p.type !== 'subscription' ? apiKeys[p.id] : undefined,
                 models: p.models.map(m => ({ model: m.model, modelName: m.modelName })),
             }));

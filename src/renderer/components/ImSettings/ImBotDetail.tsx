@@ -207,7 +207,7 @@ export default function ImBotDetail({
         }
 
         const availableProviders = providers
-            .filter(p => p.type === 'subscription' || (p.type === 'api' && apiKeys[p.id]))
+            .filter(p => p.type === 'subscription' || p.apiProtocol === 'bedrock' || (p.type === 'api' && apiKeys[p.id]))
             .map(p => ({
                 id: p.id,
                 name: p.name,
@@ -330,7 +330,7 @@ export default function ImBotDetail({
         const options = [{ value: '', label: '默认 (Anthropic 订阅)' }];
         for (const p of providers) {
             if (p.type === 'subscription') continue;
-            if (p.type === 'api' && apiKeys[p.id]) {
+            if (p.apiProtocol === 'bedrock' || (p.type === 'api' && apiKeys[p.id])) {
                 options.push({ value: p.id, label: p.name });
             }
         }
@@ -595,7 +595,7 @@ export default function ImBotDetail({
                         });
                     }
                     const availableProvidersList = providers
-                        .filter(p => p.type === 'subscription' || (p.type === 'api' && apiKeys[p.id]))
+                        .filter(p => p.type === 'subscription' || p.apiProtocol === 'bedrock' || (p.type === 'api' && apiKeys[p.id]))
                         .map(p => ({
                             id: p.id, name: p.name, primaryModel: p.primaryModel,
                             baseUrl: p.config.baseUrl, authType: p.authType,

@@ -192,17 +192,26 @@ async function verifyViaSdk(
 }
 
 /**
- * Verify a provider API key via SDK.
+ * Verify provider connectivity via SDK.
  * Uses the same SDK path as normal chat requests, ensuring verification = real usage.
  */
 export async function verifyProviderViaSdk(
-  baseUrl: string,
-  apiKey: string,
-  authType: string,
-  model?: string,
-  apiProtocol?: 'anthropic' | 'openai',
+  opts: {
+    baseUrl?: string;
+    apiKey?: string;
+    authType?: string;
+    model?: string;
+    apiProtocol?: 'anthropic' | 'openai' | 'bedrock';
+  },
 ): Promise<{ success: boolean; error?: string }> {
-  console.log(`[provider/verify] Starting SDK verification for ${baseUrl}, model=${model ?? 'default'}, authType=${authType}, apiProtocol=${apiProtocol ?? 'anthropic'}`);
+  const {
+    baseUrl,
+    apiKey,
+    authType = 'both',
+    model,
+    apiProtocol,
+  } = opts;
+  console.log(`[provider/verify] Starting SDK verification for ${baseUrl ?? 'default'}, model=${model ?? 'default'}, authType=${authType}, apiProtocol=${apiProtocol ?? 'anthropic'}`);
   const env = buildClaudeSessionEnv({
     baseUrl,
     apiKey,
