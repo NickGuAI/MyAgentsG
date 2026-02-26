@@ -109,7 +109,7 @@ pub struct ImConfig {
     pub provider_env_json: Option<String>,
     #[serde(default)]
     pub mcp_servers_json: Option<String>,
-    /// Available providers for /provider command: [{id, name, primaryModel, baseUrl?, authType?, apiKey?}]
+    /// Available providers for /provider command: [{id, name, primaryModel, baseUrl?, authType?, apiProtocol?, apiKey?}]
     #[serde(default)]
     pub available_providers_json: Option<String>,
     // ===== Heartbeat (v0.1.21) =====

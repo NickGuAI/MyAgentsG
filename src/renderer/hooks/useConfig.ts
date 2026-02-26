@@ -139,10 +139,10 @@ export function useConfig(): UseConfigResult {
             if (botsNeedingSync.length > 0) {
                 const mergedProviders = mergePresetCustomModels(loadedProviders, loadedConfig.presetCustomModels);
                 const availableProviders = mergedProviders
-                    .filter(p => p.type === 'subscription' || (p.type === 'api' && loadedApiKeys[p.id]))
+                    .filter(p => p.type === 'subscription' || p.apiProtocol === 'bedrock' || (p.type === 'api' && loadedApiKeys[p.id]))
                     .map(p => ({
                         id: p.id, name: p.name, primaryModel: p.primaryModel,
-                        baseUrl: p.config.baseUrl, authType: p.authType,
+                        baseUrl: p.config.baseUrl, authType: p.authType, apiProtocol: p.apiProtocol,
                         apiKey: p.type !== 'subscription' ? loadedApiKeys[p.id] : undefined,
                         models: p.models.map(m => ({ model: m.model, modelName: m.modelName })),
                     }));

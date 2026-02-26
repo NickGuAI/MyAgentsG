@@ -81,8 +81,9 @@ interface Provider {
 | 硅基流动 | `https://api.siliconflow.cn/` | 云服务商 | authType: api_key |
 | ZenMux | `https://zenmux.ai/api/anthropic` | 云服务商 | 多模型聚合路由 |
 | OpenRouter | `https://openrouter.ai/api` | 云服务商 | authType: auth_token_clear_api_key |
+| AWS Bedrock | N/A（Bedrock 模式） | 云服务商 | `apiProtocol: bedrock`，通过 `CLAUDE_CODE_USE_BEDROCK=1` + AWS 凭证链 |
 
-> **注意**：所有供应商使用 Anthropic 兼容端点。不同供应商 `authType` 可能不同，详见 `types.ts` 中的 `PRESET_PROVIDERS`。
+> **注意**：除 AWS Bedrock 外，其他供应商均使用 Anthropic 兼容端点。不同供应商 `authType` 可能不同，详见 `types.ts` 中的 `PRESET_PROVIDERS`。
 
 ---
 
@@ -311,4 +312,3 @@ function checkDecorativeToolText(text: string): { filtered: boolean; reason?: st
 - 使用**多条件匹配**，避免误伤正常内容
 - 添加长度限制（50-5000 字符），进一步降低误判风险
 - 记录过滤日志，便于调试
-

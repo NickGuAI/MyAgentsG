@@ -191,7 +191,7 @@ export type ProviderEnv = {
   baseUrl?: string;
   apiKey?: string;
   authType?: 'auth_token' | 'api_key' | 'both' | 'auth_token_clear_api_key';
-  apiProtocol?: 'anthropic' | 'openai';
+  apiProtocol?: 'anthropic' | 'openai' | 'bedrock';
 };
 let currentProviderEnv: ProviderEnv | undefined = undefined;
 
@@ -1621,6 +1621,28 @@ export function buildClaudeSessionEnv(providerEnv?: ProviderEnv): NodeJS.Process
   // Use provided providerEnv or fall back to currentProviderEnv
   const effectiveProviderEnv = providerEnv ?? currentProviderEnv;
 
+  // Claude Code Bedrock mode
+  if (effectiveProviderEnv?.apiProtocol === 'bedrock') {
+    env.CLAUDE_CODE_USE_BEDROCK = '1';
+    // AWS region is required in Bedrock mode; prefer existing env and fallback to a safe default.
+    if (!env.AWS_REGION || env.AWS_REGION.trim().length === 0) {
+      env.AWS_REGION = 'us-east-1';
+    }
+    if (!env.AWS_DEFAULT_REGION || env.AWS_DEFAULT_REGION.trim().length === 0) {
+      env.AWS_DEFAULT_REGION = env.AWS_REGION;
+    }
+    // Bedrock mode should not carry Anthropic/OpenAI bridge variables.
+    delete env.ANTHROPIC_BASE_URL;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    delete env.ANTHROPIC_API_KEY;
+    currentOpenAiBridgeConfig = null;
+    console.log(`[env] Bedrock mode enabled (CLAUDE_CODE_USE_BEDROCK=1, AWS_REGION=${env.AWS_REGION})`);
+    return env;
+  }
+
+  // Ensure Bedrock mode flag is cleared when not using Bedrock.
+  delete env.CLAUDE_CODE_USE_BEDROCK;
+
   // OpenAI Bridge: if provider uses OpenAI protocol, loopback to sidecar
   if (effectiveProviderEnv?.apiProtocol === 'openai' && sidecarPort > 0) {
     // SDK requests go to sidecar's /v1/messages route, which translates to OpenAI format
@@ -2938,22 +2960,35 @@ export async function enqueueUserMessage(
   // SKIP for queued messages: provider/model changes during streaming would cause a session
   // restart that wipes the queue and races with the active stream. Queued messages inherit
   // the current session's provider/model configuration.
+  const getProtocol = (env?: ProviderEnv): 'anthropic' | 'openai' | 'bedrock' =>
+    env?.apiProtocol ?? 'anthropic';
+  const providerLabel = (env?: ProviderEnv): string => {
+    const protocol = getProtocol(env);
+    if (protocol === 'bedrock') return 'bedrock';
+    if (protocol === 'openai') return `openai:${env?.baseUrl ?? 'default'}`;
+    return env?.baseUrl ?? 'anthropic';
+  };
+  const isAnthropicOfficial = (env?: ProviderEnv): boolean =>
+    getProtocol(env) === 'anthropic' && !env?.baseUrl;
+
   const switchingToSubscription = !isSessionBusy && !providerEnv && currentProviderEnv;
   const baseUrlChanged = switchingToSubscription ||
     (!isSessionBusy && providerEnv && providerEnv.baseUrl !== currentProviderEnv?.baseUrl);
-  const providerChanged = baseUrlChanged || (!isSessionBusy && providerEnv && (
-    providerEnv.apiKey !== currentProviderEnv?.apiKey
-  ));
+  const apiKeyChanged = !isSessionBusy && providerEnv && providerEnv.apiKey !== currentProviderEnv?.apiKey;
+  const protocolChanged = !isSessionBusy && getProtocol(providerEnv) !== getProtocol(currentProviderEnv);
+  const providerChanged = baseUrlChanged || apiKeyChanged || protocolChanged;
 
   if (providerChanged && querySession) {
-    const fromLabel = currentProviderEnv?.baseUrl ?? 'anthropic';
-    const toLabel = providerEnv?.baseUrl ?? 'anthropic';
+    const fromLabel = providerLabel(currentProviderEnv);
+    const toLabel = providerLabel(providerEnv);
     if (isDebugMode) console.log(`[agent] provider changed from ${fromLabel} to ${toLabel}, restarting session`);
 
     // Resume logic: Anthropic official validates thinking block signatures, third-party providers don't.
-    // Only skip resume when switching FROM third-party (has baseUrl) TO Anthropic official (no baseUrl).
+    // Only skip resume when switching FROM third-party (non-anthropic protocol or custom baseUrl)
+    // TO Anthropic official (anthropic protocol + no baseUrl).
     // All other transitions (official→third-party, third-party→third-party, official→official) can safely resume.
-    const switchingFromThirdPartyToAnthropic = currentProviderEnv?.baseUrl && !providerEnv?.baseUrl;
+    const switchingFromThirdPartyToAnthropic =
+      !isAnthropicOfficial(currentProviderEnv) && isAnthropicOfficial(providerEnv);
     if (switchingFromThirdPartyToAnthropic) {
       // Anthropic 官方验证 thinking block 签名，第三方不验证，必须新建 session
       sessionRegistered = false;
@@ -2988,7 +3023,7 @@ export async function enqueueUserMessage(
   } else if (providerEnv) {
     // Provider not changed (or first message with API provider), just update tracking
     currentProviderEnv = providerEnv;
-    if (isDebugMode) console.log(`[agent] provider env set: baseUrl=${providerEnv.baseUrl ?? 'anthropic'}`);
+    if (isDebugMode) console.log(`[agent] provider env set: ${providerLabel(providerEnv)}`);
   } else if (!providerEnv && !currentProviderEnv) {
     // Both undefined — subscription mode, no change needed
     if (isDebugMode) console.log('[agent] subscription mode, no provider env');

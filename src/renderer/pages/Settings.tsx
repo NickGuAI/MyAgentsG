@@ -866,26 +866,30 @@ export default function Settings({ initialSection, onSectionChange, isActive, up
         }
     }, [subscriptionStatus, saveProviderVerifyStatus, toast]);
 
-    // Verify API key for a provider
-    const verifyProvider = useCallback(async (provider: Provider, apiKey: string) => {
-        if (!apiKey || !provider.config.baseUrl) {
+    // Verify provider connectivity via SDK
+    const verifyProvider = useCallback(async (provider: Provider, apiKey?: string) => {
+        const isBedrock = provider.apiProtocol === 'bedrock';
+        if (!isBedrock && (!apiKey || !provider.config.baseUrl)) {
             console.warn('[verifyProvider] Missing apiKey or baseUrl');
             return;
         }
 
         console.log('[verifyProvider] ========================');
         console.log('[verifyProvider] Provider:', provider.id, provider.name);
-        console.log('[verifyProvider] baseUrl:', provider.config.baseUrl);
+        console.log('[verifyProvider] baseUrl:', provider.config.baseUrl ?? '(default)');
         console.log('[verifyProvider] model:', provider.primaryModel);
-        console.log('[verifyProvider] apiKey:', apiKey.slice(0, 10) + '...');
+        if (apiKey) {
+            console.log('[verifyProvider] apiKey:', apiKey.slice(0, 10) + '...');
+        }
+        console.log('[verifyProvider] apiProtocol:', provider.apiProtocol ?? 'anthropic');
 
         setVerifyLoading((prev) => ({ ...prev, [provider.id]: true }));
         setVerifyError((prev) => ({ ...prev, [provider.id]: '' }));
 
         try {
             const result = await apiPostJson<{ success: boolean; error?: string; debug?: unknown }>('/api/provider/verify', {
-                baseUrl: provider.config.baseUrl,
-                apiKey,
+                baseUrl: isBedrock ? undefined : provider.config.baseUrl,
+                apiKey: isBedrock ? undefined : apiKey,
                 model: provider.primaryModel,
                 authType: provider.authType,
                 apiProtocol: provider.apiProtocol,
@@ -1197,8 +1201,9 @@ export default function Settings({ initialSection, onSectionChange, isActive, up
         const verifyStatus = cached?.status; // 'valid' | 'invalid' | undefined
         const error = verifyError[provider.id];
         const hasKey = !!apiKeys[provider.id];
+        const hasCredentials = provider.apiProtocol === 'bedrock' || hasKey;
 
-        if (!hasKey) {
+        if (!hasCredentials) {
             return null;
         }
 
@@ -1373,7 +1378,7 @@ export default function Settings({ initialSection, onSectionChange, isActive, up
                         </div>
 
                         <p className="mb-6 text-sm text-[var(--ink-muted)]">
-                            配置 API 密钥以使用不同的模型供应商
+                            配置供应商连接参数以使用不同模型。部分供应商使用 API Key，Bedrock 使用 AWS 凭证链。
                         </p>
 
                         {/* Provider list */}
@@ -1394,6 +1399,11 @@ export default function Settings({ initialSection, onSectionChange, isActive, up
                                                 {provider.apiProtocol === 'openai' && (
                                                     <span className="shrink-0 rounded bg-[var(--paper-contrast)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--ink-muted)]">
                                                         OpenAI 协议
+                                                    </span>
+                                                )}
+                                                {provider.apiProtocol === 'bedrock' && (
+                                                    <span className="shrink-0 rounded bg-[var(--paper-contrast)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--ink-muted)]">
+                                                        Bedrock 协议
                                                     </span>
                                                 )}
                                             </div>
@@ -1422,19 +1432,28 @@ export default function Settings({ initialSection, onSectionChange, isActive, up
 
                                     {/* API Key input */}
                                     {provider.type === 'api' && (
-                                        <div className="flex items-center gap-2">
-                                            <div className="relative flex-1">
-                                                <KeyRound className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--ink-muted)]" />
-                                                <input
-                                                    type="password"
-                                                    placeholder="输入 API Key"
-                                                    value={apiKeys[provider.id] || ''}
-                                                    onChange={(e) => handleSaveApiKey(provider, e.target.value)}
-                                                    className="w-full rounded-lg border border-[var(--line)] bg-[var(--paper)] py-2.5 pl-10 pr-4 text-sm text-[var(--ink)] placeholder-[var(--ink-muted)] transition-colors focus:border-[var(--ink)] focus:outline-none"
-                                                />
+                                        provider.apiProtocol === 'bedrock' ? (
+                                            <div className="flex items-center justify-between gap-2">
+                                                <p className="text-sm text-[var(--ink-muted)]">
+                                                    使用 AWS 凭证链（环境变量或 <span className="font-mono">~/.aws/credentials</span>）
+                                                </p>
+                                                {renderVerifyStatus(provider)}
                                             </div>
-                                            {renderVerifyStatus(provider)}
-                                        </div>
+                                        ) : (
+                                            <div className="flex items-center gap-2">
+                                                <div className="relative flex-1">
+                                                    <KeyRound className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--ink-muted)]" />
+                                                    <input
+                                                        type="password"
+                                                        placeholder="输入 API Key"
+                                                        value={apiKeys[provider.id] || ''}
+                                                        onChange={(e) => handleSaveApiKey(provider, e.target.value)}
+                                                        className="w-full rounded-lg border border-[var(--line)] bg-[var(--paper)] py-2.5 pl-10 pr-4 text-sm text-[var(--ink)] placeholder-[var(--ink-muted)] transition-colors focus:border-[var(--ink)] focus:outline-none"
+                                                    />
+                                                </div>
+                                                {renderVerifyStatus(provider)}
+                                            </div>
+                                        )
                                     )}
 
                                     {/* Subscription type - show status */}

@@ -170,7 +170,7 @@ type SendMessagePayload = {
     baseUrl?: string;
     apiKey?: string;
     authType?: 'auth_token' | 'api_key' | 'both' | 'auth_token_clear_api_key';
-    apiProtocol?: 'anthropic' | 'openai';
+    apiProtocol?: 'anthropic' | 'openai' | 'bedrock';
   };
 };
 
@@ -188,7 +188,7 @@ type CronExecutePayload = {
     baseUrl?: string;
     apiKey?: string;
     authType?: 'auth_token' | 'api_key' | 'both' | 'auth_token_clear_api_key';
-    apiProtocol?: 'anthropic' | 'openai';
+    apiProtocol?: 'anthropic' | 'openai' | 'bedrock';
   };
   /** Run mode: "single_session" (keep context) or "new_session" (fresh each time) */
   runMode?: 'single_session' | 'new_session';
@@ -2489,25 +2489,36 @@ async function main() {
           };
 
           const { baseUrl, apiKey, model, authType, apiProtocol } = payload;
+          const protocol =
+            apiProtocol === 'openai' ? 'openai'
+              : apiProtocol === 'bedrock' ? 'bedrock'
+                : 'anthropic';
 
-          if (!baseUrl || !apiKey) {
+          if (protocol !== 'bedrock' && (!baseUrl || !apiKey)) {
             return jsonResponse({ success: false, error: 'baseUrl and apiKey are required.' }, 400);
           }
 
           console.log(`[api/provider/verify] =========================`);
-          console.log(`[api/provider/verify] baseUrl: ${baseUrl}`);
-          console.log(`[api/provider/verify] apiKey: ${apiKey.slice(0, 10)}...`);
+          console.log(`[api/provider/verify] baseUrl: ${baseUrl ?? '(default)'}`);
+          if (apiKey) {
+            console.log(`[api/provider/verify] apiKey: ${apiKey.slice(0, 10)}...`);
+          } else {
+            console.log('[api/provider/verify] apiKey: (not provided)');
+          }
           console.log(`[api/provider/verify] model: ${model ?? 'default'}`);
           console.log(`[api/provider/verify] authType: ${authType ?? 'both'}`);
-          console.log(`[api/provider/verify] apiProtocol: ${apiProtocol ?? 'anthropic'}`);
+          console.log(`[api/provider/verify] apiProtocol: ${protocol}`);
 
-          // Unified SDK verification for all protocols (Anthropic + OpenAI)
+          // Unified SDK verification for all protocols (Anthropic + OpenAI + Bedrock)
           // For OpenAI protocol: SDK → CLI → bridge loopback → upstream (end-to-end)
-          // For Anthropic protocol: SDK → CLI → upstream (same as before)
-          const result = await verifyProviderViaSdk(
-            baseUrl, apiKey, authType ?? 'both', model || undefined,
-            apiProtocol === 'openai' ? 'openai' : undefined,
-          );
+          // For Anthropic/Bedrock protocols: SDK → CLI → upstream
+          const result = await verifyProviderViaSdk({
+            baseUrl: protocol === 'bedrock' ? undefined : baseUrl,
+            apiKey: protocol === 'bedrock' ? undefined : apiKey,
+            authType: authType ?? 'both',
+            model: model || undefined,
+            apiProtocol: protocol,
+          });
 
           console.log(`[api/provider/verify] result:`, JSON.stringify(result));
           console.log(`[api/provider/verify] =========================`);

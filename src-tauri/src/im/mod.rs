@@ -832,11 +832,23 @@ pub async fn start_im_bot<R: Runtime>(
                                     p["id"].as_str().map(|s| s.contains("sub")).unwrap_or(false)
                                 }).cloned()
                             } else {
-                                // Match by baseUrl
+                                // Match by baseUrl first; fallback to apiProtocol (for providers like Bedrock without baseUrl)
                                 let base_url = current_env.as_ref()
-                                    .and_then(|v| v["baseUrl"].as_str());
+                                    .and_then(|v| v["baseUrl"].as_str())
+                                    .filter(|s| !s.is_empty());
+                                let api_protocol = current_env.as_ref()
+                                    .and_then(|v| v["apiProtocol"].as_str())
+                                    .filter(|s| !s.is_empty());
                                 providers.iter()
-                                    .find(|p| p["baseUrl"].as_str() == base_url)
+                                    .find(|p| {
+                                        if let Some(url) = base_url {
+                                            p["baseUrl"].as_str() == Some(url)
+                                        } else if let Some(protocol) = api_protocol {
+                                            p["apiProtocol"].as_str() == Some(protocol)
+                                        } else {
+                                            false
+                                        }
+                                    })
                                     .cloned()
                             };
                             current_provider
@@ -937,11 +949,23 @@ pub async fn start_im_bot<R: Runtime>(
                             let current_name = if current_env.is_none() {
                                 "Anthropic (订阅) [默认]".to_string()
                             } else {
-                                // Find name by matching baseUrl
+                                // Find name by matching baseUrl first, then apiProtocol (for providers without baseUrl)
                                 let base_url = current_env.as_ref()
-                                    .and_then(|v| v["baseUrl"].as_str());
+                                    .and_then(|v| v["baseUrl"].as_str())
+                                    .filter(|s| !s.is_empty());
+                                let api_protocol = current_env.as_ref()
+                                    .and_then(|v| v["apiProtocol"].as_str())
+                                    .filter(|s| !s.is_empty());
                                 providers.iter()
-                                    .find(|p| p["baseUrl"].as_str() == base_url)
+                                    .find(|p| {
+                                        if let Some(url) = base_url {
+                                            p["baseUrl"].as_str() == Some(url)
+                                        } else if let Some(protocol) = api_protocol {
+                                            p["apiProtocol"].as_str() == Some(protocol)
+                                        } else {
+                                            false
+                                        }
+                                    })
                                     .and_then(|p| p["name"].as_str())
                                     .unwrap_or("自定义")
                                     .to_string()
